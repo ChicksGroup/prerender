@@ -1,5 +1,7 @@
 # Prerender
 
+$\color{Red}\Huge{\textsf{This repository will be archived and made private on June 4, 2026}}$
+
 Prerender is a node server that uses Headless Chrome to render HTML, screenshots, PDFs, and HAR files out of any web page. The Prerender server listens for an http request, takes the URL and loads it in Headless Chrome, waits for the page to finish loading by waiting for the network to be idle, and then returns your content.
 
 ##### The quickest way to run your own prerender server:
