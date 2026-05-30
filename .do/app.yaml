@@ -12,13 +12,16 @@ services:
   - name: prerender
     dockerfile_path: Dockerfile
     source_dir: /
-    # Replace with your fork's repo so push-to-deploy works (or deploy via
-    # doctl / container registry instead).
+    # Push-to-deploy from the fork's master. (Alternatively deploy via doctl /
+    # container registry and drop this github block.)
     github:
-      repo: prerender/prerender
+      repo: ChicksGroup/prerender
       branch: master
       deploy_on_push: true
     http_port: 3000
+    # Dedicated 1 vCPU / 2 GB (~$39/mo). Dedicated tier is required for autoscaling;
+    # we scale throughput horizontally (min 2 / max 6) rather than with a bigger box,
+    # since the single vCPU — not RAM — is the render bottleneck.
     instance_size_slug: apps-d-1vcpu-2gb
     autoscaling:
       min_instance_count: 2
