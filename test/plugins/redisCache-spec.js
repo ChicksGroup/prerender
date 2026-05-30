@@ -53,6 +53,7 @@ describe('redisCache plugin', function () {
       get: sandbox.stub(),
       set: sandbox.stub(),
       eval: sandbox.stub().resolves(1),
+      zadd: sandbox.stub().resolves(1),
     };
     res = { send: sandbox.spy(), setHeader: sandbox.spy() };
     next = sandbox.spy();
@@ -267,5 +268,239 @@ describe('redisCache plugin', function () {
       await redisCache.requestReceived(req, res, next);
       assert.equal(client.set.firstCall.args[0], LOCK_KEY);
     });
+  });
+});
+
+describe('redisCache introspection & guards', function () {
+  let sandbox, client, res, next;
+
+  function makeFakeRedis() {
+    const kv = new Map();
+    const z = new Map(); // member -> score
+    const sortedAsc = () => [...z.entries()].sort((a, b) => a[1] - b[1]);
+    const withScores = (pairs) => pairs.flatMap(([m, s]) => [m, String(s)]);
+    return {
+      _kv: kv,
+      _z: z,
+      exists: (k) => Promise.resolve(kv.has(k) ? 1 : 0),
+      set: (k, v) => {
+        kv.set(k, v);
+        return Promise.resolve('OK');
+      },
+      zadd: (key, score, member) => {
+        z.set(member, Number(score));
+        return Promise.resolve(1);
+      },
+      zscore: (key, member) =>
+        Promise.resolve(z.has(member) ? String(z.get(member)) : null),
+      zcard: () => Promise.resolve(z.size),
+      zrange: (key, start, stop, ws) => {
+        const arr = sortedAsc();
+        const slice = arr.slice(start, stop === -1 ? arr.length : stop + 1);
+        return Promise.resolve(ws ? withScores(slice) : slice.map(([m]) => m));
+      },
+      zrevrange: (key, start, stop, ws) => {
+        const arr = sortedAsc().reverse();
+        const slice = arr.slice(start, stop === -1 ? arr.length : stop + 1);
+        return Promise.resolve(ws ? withScores(slice) : slice.map(([m]) => m));
+      },
+      zrangebyscore: (key, min, max, ws, limitKw, offset, count) => {
+        const minN = min === '-inf' ? -Infinity : Number(min);
+        const maxN = max === '+inf' ? Infinity : Number(max);
+        let arr = sortedAsc().filter(([, s]) => s >= minN && s <= maxN);
+        if (limitKw === 'LIMIT') arr = arr.slice(offset, offset + count);
+        return Promise.resolve(ws ? withScores(arr) : arr.map(([m]) => m));
+      },
+      eval: () => Promise.resolve(1),
+    };
+  }
+
+  beforeEach(function () {
+    sandbox = sinon.createSandbox();
+    client = makeFakeRedis();
+    res = { send: sandbox.spy(), setHeader: sandbox.spy() };
+    next = sandbox.spy();
+    redisCache._reset();
+    redisCache._setConfigForTests();
+    redisCache._setEnabledForTests(true);
+    redisCache._setClientForTests(client);
+  });
+
+  afterEach(function () {
+    sandbox.restore();
+    redisCache._reset();
+  });
+
+  it('status() reports cached + storedAt for known/unknown URLs', async function () {
+    const url = 'https://www.chicksx.com/';
+    client._kv.set('prerender:v1:html:' + url, 'x');
+    client._z.set(url, 1700000000000);
+    const rows = await redisCache.status([
+      url,
+      'https://www.chicksx.com/missing',
+    ]);
+    assert.equal(rows.length, 2);
+    assert.equal(rows[0].cached, true);
+    assert.equal(rows[0].storedAt, 1700000000000);
+    assert.equal(rows[1].cached, false);
+    assert.equal(rows[1].storedAt, null);
+  });
+
+  it('stale() returns oldest entries first', async function () {
+    client._z.set('https://a/', 100);
+    client._z.set('https://b/', 300);
+    client._z.set('https://c/', 200);
+    const rows = await redisCache.stale({ limit: 2 });
+    assert.deepEqual(
+      rows.map((r) => r.url),
+      ['https://a/', 'https://c/'],
+    );
+    assert.equal(rows[0].storedAt, 100);
+  });
+
+  it('stale() with olderThanMs filters out fresh entries', async function () {
+    const now = Date.now();
+    client._z.set('https://old/', now - 48 * 3600 * 1000);
+    client._z.set('https://fresh/', now - 60 * 1000);
+    const rows = await redisCache.stale({
+      limit: 10,
+      olderThanMs: 24 * 3600 * 1000,
+    });
+    assert.deepEqual(
+      rows.map((r) => r.url),
+      ['https://old/'],
+    );
+  });
+
+  it('stats() reports count + oldest/newest', async function () {
+    client._z.set('https://a/', 100);
+    client._z.set('https://b/', 300);
+    const s = await redisCache.stats();
+    assert.equal(s.enabled, true);
+    assert.equal(s.count, 2);
+    assert.equal(s.oldestStoredAt, 100);
+    assert.equal(s.newestStoredAt, 300);
+  });
+
+  it('status() rejects when cache disabled', async function () {
+    redisCache._setEnabledForTests(false);
+    await assert.rejects(() => redisCache.status(['https://x/']));
+  });
+
+  it('does NOT cache a 200 smaller than CACHE_MIN_HTML_BYTES', async function () {
+    redisCache._setConfigForTests({ minHtmlBytes: 20000 });
+    const req = makeReq({
+      prerender: { _cacheLockOwner: true, content: '<html>tiny</html>' },
+    });
+    await redisCache.beforeSend(req, res, next);
+    assert.equal(client._kv.size, 0); // nothing stored
+    assert(next.calledOnce);
+  });
+
+  it('caches a 200 at/above CACHE_MIN_HTML_BYTES and indexes it', async function () {
+    redisCache._setConfigForTests({ minHtmlBytes: 100 });
+    const big = '<html><body>' + 'x'.repeat(500) + '</body></html>';
+    const req = makeReq({ prerender: { _cacheLockOwner: true, content: big } });
+    await redisCache.beforeSend(req, res, next);
+    assert.equal(client._kv.size, 1); // html stored
+    assert.equal(client._z.size, 1); // indexed for refresh
+  });
+});
+
+describe('redisCache spaces store (CACHE_STORE=spaces)', function () {
+  let sandbox, client, store, res, next;
+
+  function makeStore() {
+    const m = new Map();
+    return {
+      _m: m,
+      put: (key, buffer, meta) => {
+        m.set(key, { body: Buffer.from(buffer), meta });
+        return Promise.resolve();
+      },
+      get: (key) => Promise.resolve(m.has(key) ? m.get(key) : null),
+    };
+  }
+
+  beforeEach(function () {
+    sandbox = sinon.createSandbox();
+    client = {
+      set: sandbox.stub().resolves('OK'), // single-flight lock acquire
+      eval: sandbox.stub().resolves(1), // lock release
+      zadd: sandbox.stub().resolves(1), // index
+      zscore: sandbox.stub().resolves(null),
+    };
+    store = makeStore();
+    res = { send: sandbox.spy(), setHeader: sandbox.spy() };
+    next = sandbox.spy();
+    redisCache._reset();
+    redisCache._setConfigForTests({ store: 'spaces', compression: true });
+    redisCache._setEnabledForTests(true);
+    redisCache._setClientForTests(client);
+    redisCache._setObjectStoreForTests(store);
+  });
+
+  afterEach(function () {
+    sandbox.restore();
+    redisCache._reset();
+  });
+
+  it('writes the body to the object store (not redis) and indexes it', async function () {
+    const big = '<html><body>' + 'y'.repeat(500) + '</body></html>';
+    const req = makeReq({
+      prerender: { _cacheLockOwner: true, content: big, headers: {} },
+    });
+    await redisCache.beforeSend(req, res, next);
+    assert.equal(store._m.size, 1); // body in Spaces
+    assert(client.set.notCalled); // body NOT written to Redis
+    assert(client.zadd.calledOnce); // indexed for refresh
+    assert(next.calledOnce);
+  });
+
+  it('round-trips a body through the object store on a hit', async function () {
+    const html = '<html><body>hello-spaces</body></html>';
+    const wreq = makeReq({
+      prerender: {
+        _cacheLockOwner: true,
+        content: html,
+        headers: { 'content-type': 'text/html' },
+      },
+    });
+    await redisCache.beforeSend(wreq, res, next);
+
+    const rreq = makeReq();
+    await redisCache.requestReceived(rreq, res, next);
+    assert(res.send.called);
+    assert.equal(res.send.lastCall.args[0], 200);
+    assert.equal(res.send.lastCall.args[1], html);
+    assert(res.setHeader.calledWith('X-Prerender-Cache', 'HIT'));
+  });
+
+  it('301 round-trips Location via object metadata', async function () {
+    const wreq = makeReq({
+      prerender: {
+        _cacheLockOwner: true,
+        statusCode: 301,
+        content: '<html></html>',
+        headers: { Location: 'https://www.chicksgold.com/new' },
+      },
+    });
+    await redisCache.beforeSend(wreq, res, next);
+
+    const rreq = makeReq();
+    await redisCache.requestReceived(rreq, res, next);
+    assert.equal(rreq.prerender.statusCode, 301);
+    assert.equal(
+      rreq.prerender.headers.location,
+      'https://www.chicksgold.com/new',
+    );
+  });
+
+  it('miss falls through to render (acquires lock) when the store is empty', async function () {
+    const req = makeReq();
+    await redisCache.requestReceived(req, res, next);
+    assert(next.calledOnce);
+    assert(res.send.notCalled);
+    assert.equal(req.prerender._cacheLockOwner, true);
   });
 });
