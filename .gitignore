@@ -5,3 +5,6 @@ node_modules/
 .ebextensions/
 .idea/
 .vscode/
+.env
+.env.*
+!.env.example

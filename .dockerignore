@@ -1,0 +1,13 @@
+node_modules
+npm-debug.log
+.git
+.github
+.idea
+.vscode
+*.iml
+.DS_Store
+test
+*.md
+.do
+Dockerfile
+.dockerignore
