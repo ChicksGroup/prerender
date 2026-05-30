@@ -277,11 +277,25 @@ describe('redisCache introspection & guards', function () {
   function makeFakeRedis() {
     const kv = new Map();
     const z = new Map(); // member -> score
+    const h = new Map(); // hashKey -> Map(field -> number)
     const sortedAsc = () => [...z.entries()].sort((a, b) => a[1] - b[1]);
     const withScores = (pairs) => pairs.flatMap(([m, s]) => [m, String(s)]);
     return {
       _kv: kv,
       _z: z,
+      _h: h,
+      hincrby: (key, field, n) => {
+        if (!h.has(key)) h.set(key, new Map());
+        const m = h.get(key);
+        m.set(field, (m.get(field) || 0) + Number(n));
+        return Promise.resolve(m.get(field));
+      },
+      hgetall: (key) => {
+        const m = h.get(key) || new Map();
+        const o = {};
+        for (const [f, v] of m) o[f] = String(v);
+        return Promise.resolve(o);
+      },
       exists: (k) => Promise.resolve(kv.has(k) ? 1 : 0),
       set: (k, v) => {
         kv.set(k, v);
@@ -404,6 +418,69 @@ describe('redisCache introspection & guards', function () {
     await redisCache.beforeSend(req, res, next);
     assert.equal(client._kv.size, 1); // html stored
     assert.equal(client._z.size, 1); // indexed for refresh
+  });
+
+  it('statsByDomain() returns { enabled:false } when disabled', async function () {
+    redisCache._setEnabledForTests(false);
+    const s = await redisCache.statsByDomain();
+    assert.equal(s.enabled, false);
+  });
+
+  it('statsByDomain() aggregates per-domain count/buckets, sorted desc', async function () {
+    const now = Date.now();
+    client._z.set('https://www.chicksgold.com/a', now - 30 * 60 * 1000); // <1h
+    client._z.set('https://www.chicksgold.com/b', now - 5 * 3600 * 1000); // 1-24h
+    client._z.set('https://www.chicksx.com/c', now - 10 * 24 * 3600 * 1000); // 7-30d
+    const s = await redisCache.statsByDomain();
+    assert.equal(s.enabled, true);
+    assert.equal(s.global.count, 3);
+    assert.equal(s.domainCount, 2);
+    assert.equal(s.domains[0].count >= s.domains[1].count, true); // sorted desc
+    const cg = s.domains.find((d) => d.domain === 'www.chicksgold.com');
+    assert.equal(cg.count, 2);
+    assert.equal(cg.buckets['<1h'], 1);
+    assert.equal(cg.buckets['1-24h'], 1);
+    assert.equal(typeof s.computedAt, 'number');
+  });
+
+  it('statsByDomain() memoizes within TTL (single ZRANGE)', async function () {
+    redisCache._setConfigForTests({ statsCacheTtlMs: 60000 });
+    redisCache._setEnabledForTests(true);
+    redisCache._setClientForTests(client);
+    const spy = sandbox.spy(client, 'zrange');
+    client._z.set('https://a/x', Date.now());
+    await redisCache.statsByDomain();
+    await redisCache.statsByDomain();
+    assert.equal(spy.callCount, 1); // second served from memo
+  });
+
+  it('statsByDomain() buckets unparseable members under "unknown"', async function () {
+    client._z.set('not a url', Date.now());
+    const s = await redisCache.statsByDomain();
+    assert.ok(s.domains.find((d) => d.domain === 'unknown'));
+  });
+
+  it('incrMetric()/metrics() round-trip per-domain (global = sum of domains)', async function () {
+    await redisCache.incrMetric('renders', 'https://www.chicksx.com/a');
+    await redisCache.incrMetric('renders', 'https://www.chicksx.com/b');
+    await redisCache.incrMetric(
+      'fallback_render',
+      'https://www.chicksgold.com/c',
+    );
+    const m = await redisCache.metrics();
+    assert.equal(m.enabled, true);
+    assert.equal(m.global.renders, 2);
+    assert.equal(m.global.fallback_render, 1);
+    const x = m.domains.find((d) => d.domain === 'www.chicksx.com');
+    assert.equal(x.renders, 2);
+    const g = m.domains.find((d) => d.domain === 'www.chicksgold.com');
+    assert.equal(g.fallback_render, 1);
+  });
+
+  it('metrics() returns { enabled:false } when disabled', async function () {
+    redisCache._setEnabledForTests(false);
+    const m = await redisCache.metrics();
+    assert.equal(m.enabled, false);
   });
 });
 
