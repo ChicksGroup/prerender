@@ -41,6 +41,15 @@ describe('fallback plugin', function () {
     assert.equal(fallback.enabled(), true);
   });
 
+  it('forced() requires enabled + FALLBACK_FORCE', function () {
+    fallback._setConfigForTests({ enabled: true, token: 't', force: false });
+    assert.equal(fallback.forced(), false);
+    fallback._setConfigForTests({ enabled: true, token: 't', force: true });
+    assert.equal(fallback.forced(), true);
+    fallback._setConfigForTests({ enabled: false, token: 't', force: true });
+    assert.equal(fallback.forced(), false);
+  });
+
   it('replaces a failed render with the fallback result and flags it for caching', async function () {
     fallback._setFetchForTests(() =>
       Promise.resolve({
