@@ -1,0 +1,74 @@
+# DigitalOcean App Platform spec for the self-hosted Prerender service.
+#
+#   doctl apps create --spec .do/app.yaml
+#   doctl apps update <app-id> --spec .do/app.yaml
+#
+# NOTE: autoscaling requires a dedicated/professional instance size
+# (apps-d-* slugs). Keep min_instance_count >= 2 so a restart or crash never
+# blanks the service.
+name: prerender
+region: nyc
+services:
+  - name: prerender
+    dockerfile_path: Dockerfile
+    source_dir: /
+    # Replace with your fork's repo so push-to-deploy works (or deploy via
+    # doctl / container registry instead).
+    github:
+      repo: prerender/prerender
+      branch: master
+      deploy_on_push: true
+    http_port: 3000
+    instance_size_slug: apps-d-1vcpu-2gb
+    autoscaling:
+      min_instance_count: 2
+      max_instance_count: 6
+      metrics:
+        cpu:
+          percent: 70
+    health_check:
+      http_path: /ready
+      initial_delay_seconds: 20
+      period_seconds: 10
+      timeout_seconds: 5
+      success_threshold: 1
+      failure_threshold: 3
+    envs:
+      - key: ALLOWED_DOMAINS
+        scope: RUN_TIME
+        value: chicksgold.com,www.chicksgold.com,chicksx.com,www.chicksx.com
+      - key: PRERENDER_AUTH_TOKEN
+        scope: RUN_TIME
+        type: SECRET
+        value: REPLACE_ME
+      - key: MAX_CONCURRENT_RENDERS
+        scope: RUN_TIME
+        value: "4"
+      - key: OVERLOAD_RETRY_AFTER
+        scope: RUN_TIME
+        value: "2"
+      - key: SHUTDOWN_DRAIN_TIMEOUT_MS
+        scope: RUN_TIME
+        value: "20000"
+      - key: PAGE_LOAD_TIMEOUT
+        scope: RUN_TIME
+        value: "20000"
+      - key: BROWSER_TRY_RESTART_PERIOD
+        scope: RUN_TIME
+        value: "300000"
+      - key: BROWSER_FORCE_RESTART_PERIOD
+        scope: RUN_TIME
+        value: "1800000"
+      # --- Phase 2 (HTML cache) — uncomment when the redisCache plugin lands ---
+      # - key: CACHE_ENABLED
+      #   scope: RUN_TIME
+      #   value: "true"
+      # - key: REDIS_URL
+      #   scope: RUN_TIME
+      #   value: ${valkey.DATABASE_URL}
+
+# --- Phase 2: DigitalOcean Managed Valkey for the HTML cache ---
+# databases:
+#   - name: valkey
+#     engine: VALKEY
+#     production: true
