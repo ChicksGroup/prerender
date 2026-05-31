@@ -477,6 +477,23 @@ describe('redisCache introspection & guards', function () {
     assert.equal(g.fallback_render, 1);
   });
 
+  it('incrMetric() accumulates duration sums (render_ms / cache_ms) for averages', async function () {
+    await redisCache.incrMetric('renders', 'https://www.chicksx.com/a');
+    await redisCache.incrMetric('render_ms', 'https://www.chicksx.com/a', 900);
+    await redisCache.incrMetric('renders', 'https://www.chicksx.com/a');
+    await redisCache.incrMetric('render_ms', 'https://www.chicksx.com/a', 1100);
+    await redisCache.incrMetric('cache_hits', 'https://www.chicksx.com/a');
+    await redisCache.incrMetric('cache_ms', 'https://www.chicksx.com/a', 7);
+    const m = await redisCache.metrics();
+    assert.equal(m.global.renders, 2);
+    assert.equal(m.global.render_ms, 2000); // -> avg 1000ms over 2 renders
+    assert.equal(m.global.cache_hits, 1);
+    assert.equal(m.global.cache_ms, 7);
+    const x = m.domains.find((d) => d.domain === 'www.chicksx.com');
+    assert.equal(x.render_ms, 2000);
+    assert.equal(x.cache_ms, 7);
+  });
+
   it('metrics() returns { enabled:false } when disabled', async function () {
     redisCache._setEnabledForTests(false);
     const m = await redisCache.metrics();
