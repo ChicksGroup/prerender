@@ -426,6 +426,11 @@ describe('redisCache introspection & guards', function () {
           fields.map((f) => (m.has(f) ? String(m.get(f)) : null)),
         );
       },
+      scan: (cursor, _matchKw, pattern, _countKw, _count) => {
+        const pfx = String(pattern).replace(/\*$/, '');
+        const keys = [...h.keys()].filter((k) => k.startsWith(pfx));
+        return Promise.resolve(['0', keys]);
+      },
       eval: () => Promise.resolve(1),
     };
   }
@@ -718,6 +723,31 @@ describe('redisCache introspection & guards', function () {
   it('metrics() returns { enabled:false } when disabled', async function () {
     redisCache._setEnabledForTests(false);
     const m = await redisCache.metrics();
+    assert.equal(m.enabled, false);
+  });
+
+  it('metricsAllLabels() aggregates every label HASH via SCAN', async function () {
+    redisCache._setConfigForTests({ metricsLabel: 'ondemand' });
+    redisCache._setEnabledForTests(true);
+    redisCache._setClientForTests(client);
+    await redisCache.incrMetric('renders', 'https://www.chicksgold.com/a');
+    // switch the active label and write more
+    redisCache._setConfigForTests({ metricsLabel: 'scheduled' });
+    redisCache._setEnabledForTests(true);
+    redisCache._setClientForTests(client);
+    await redisCache.incrMetric('renders', 'https://www.chicksgold.com/b');
+    await redisCache.incrMetric('renders', 'https://www.chicksgold.com/c');
+
+    const m = await redisCache.metricsAllLabels();
+    assert.equal(m.enabled, true);
+    assert.equal(m.labels.ondemand.global.renders, 1);
+    assert.equal(m.labels.scheduled.global.renders, 2);
+    assert.equal(m.labels.scheduled.domains[0].domain, 'www.chicksgold.com');
+  });
+
+  it('metricsAllLabels() returns { enabled:false } when disabled', async function () {
+    redisCache._setEnabledForTests(false);
+    const m = await redisCache.metricsAllLabels();
     assert.equal(m.enabled, false);
   });
 });
