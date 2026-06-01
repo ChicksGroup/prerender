@@ -54,6 +54,7 @@ describe('redisCache plugin', function () {
       set: sandbox.stub(),
       eval: sandbox.stub().resolves(1),
       zadd: sandbox.stub().resolves(1),
+      hset: sandbox.stub().resolves(1),
     };
     res = { send: sandbox.spy(), setHeader: sandbox.spy() };
     next = sandbox.spy();
@@ -179,6 +180,81 @@ describe('redisCache plugin', function () {
       const stored = JSON.parse(client.set.firstCall.args[1]);
       assert.equal(stored.statusCode, 301);
       assert.equal(stored.headers.location, 'https://www.chicksgold.com/new');
+    });
+
+    it('caches a 200 without a TTL (plain SET, no PX)', async function () {
+      client.set.resolves('OK');
+      const req = makeReq({ prerender: { _cacheLockOwner: true } });
+      await redisCache.beforeSend(req, res, next);
+      assert(client.set.calledOnce);
+      const args = client.set.firstCall.args;
+      assert.equal(args[0], HTML_KEY);
+      assert.equal(args[2], undefined); // no PX -> never expires
+    });
+
+    it('caches a 4xx with a PX TTL and records its status', async function () {
+      redisCache._setConfigForTests({ error4xxTtlMs: 1000 });
+      redisCache._setEnabledForTests(true);
+      redisCache._setClientForTests(client);
+      client.set.resolves('OK');
+      const req = makeReq({
+        prerender: {
+          _cacheLockOwner: true,
+          statusCode: 404,
+          content: '<html>not found</html>',
+        },
+      });
+      await redisCache.beforeSend(req, res, next);
+      assert(client.set.calledOnce);
+      const args = client.set.firstCall.args;
+      assert.equal(args[0], HTML_KEY);
+      assert.equal(args[2], 'PX'); // 4xx body auto-expires
+      assert.equal(args[3], 1000);
+      assert(client.hset.calledWith('prerender:v1:status', URL, 404));
+    });
+
+    it('caches a 403 too (all 4xx are cacheable now)', async function () {
+      client.set.resolves('OK');
+      const req = makeReq({
+        prerender: {
+          _cacheLockOwner: true,
+          statusCode: 403,
+          content: '<html>denied</html>',
+        },
+      });
+      await redisCache.beforeSend(req, res, next);
+      assert(client.set.calledOnce);
+    });
+
+    it('does NOT store our transient 408 / 429 signals', async function () {
+      for (const code of [408, 429]) {
+        client.set.resetHistory();
+        const req = makeReq({
+          prerender: {
+            _cacheLockOwner: true,
+            statusCode: code,
+            content: '<html>x</html>',
+          },
+        });
+        await redisCache.beforeSend(req, res, next);
+        assert(client.set.notCalled, 'should not cache ' + code);
+      }
+    });
+
+    it('applies the minHtmlBytes guard to 200 only (a small 404 still caches)', async function () {
+      redisCache._setConfigForTests({ minHtmlBytes: 20000, error4xxTtlMs: 1000 });
+      redisCache._setEnabledForTests(true);
+      redisCache._setClientForTests(client);
+      client.set.resolves('OK');
+      const req = makeReq({
+        prerender: {
+          _cacheLockOwner: true,
+          statusCode: 404,
+          content: '<html>tiny 404</html>',
+        },
+      });
+      await redisCache.beforeSend(req, res, next);
+      assert(client.set.calledOnce); // cached despite being < minHtmlBytes
     });
 
     it('does NOT store a timed-out render', async function () {
@@ -325,6 +401,31 @@ describe('redisCache introspection & guards', function () {
         if (limitKw === 'LIMIT') arr = arr.slice(offset, offset + count);
         return Promise.resolve(ws ? withScores(arr) : arr.map(([m]) => m));
       },
+      get: (k) => Promise.resolve(kv.has(k) ? kv.get(k) : null),
+      del: (k) => {
+        kv.delete(k);
+        return Promise.resolve(1);
+      },
+      zrem: (key, member) => {
+        z.delete(member);
+        return Promise.resolve(1);
+      },
+      hset: (key, field, val) => {
+        if (!h.has(key)) h.set(key, new Map());
+        h.get(key).set(field, Number(val));
+        return Promise.resolve(1);
+      },
+      hdel: (key, field) => {
+        const m = h.get(key);
+        if (m) m.delete(field);
+        return Promise.resolve(1);
+      },
+      hmget: (key, ...fields) => {
+        const m = h.get(key) || new Map();
+        return Promise.resolve(
+          fields.map((f) => (m.has(f) ? String(m.get(f)) : null)),
+        );
+      },
       eval: () => Promise.resolve(1),
     };
   }
@@ -358,6 +459,60 @@ describe('redisCache introspection & guards', function () {
     assert.equal(rows[0].storedAt, 1700000000000);
     assert.equal(rows[1].cached, false);
     assert.equal(rows[1].storedAt, null);
+  });
+
+  it('status() reports the per-URL status code', async function () {
+    const url = 'https://www.chicksx.com/p';
+    client._z.set(url, Date.now());
+    await client.hset('prerender:v1:status', url, 301);
+    const rows = await redisCache.status([url]);
+    assert.equal(rows[0].cached, true);
+    assert.equal(rows[0].status, 301);
+  });
+
+  it('status() keeps a fresh 4xx cached with its status', async function () {
+    const url = 'https://www.chicksx.com/missing';
+    client._z.set(url, Date.now()); // fresh (< 24h default TTL)
+    await client.hset('prerender:v1:status', url, 404);
+    const rows = await redisCache.status([url]);
+    assert.equal(rows[0].cached, true);
+    assert.equal(rows[0].status, 404);
+  });
+
+  it('status() evicts an expired 4xx and reports it uncached', async function () {
+    redisCache._setConfigForTests({ error4xxTtlMs: 1000 });
+    redisCache._setEnabledForTests(true);
+    redisCache._setClientForTests(client);
+    const url = 'https://www.chicksx.com/gone';
+    client._kv.set('prerender:v1:html:' + url, 'x');
+    client._z.set(url, Date.now() - 5000); // older than the 1s TTL
+    await client.hset('prerender:v1:status', url, 404);
+    const rows = await redisCache.status([url]);
+    assert.equal(rows[0].cached, false);
+    assert.equal(rows[0].status, null);
+    // reaped from every structure
+    assert.equal(client._z.has(url), false);
+    assert.equal(client._kv.has('prerender:v1:html:' + url), false);
+    assert.equal(client._h.get('prerender:v1:status').has(url), false);
+  });
+
+  it('status() does NOT evict a fresh 3xx (no TTL)', async function () {
+    redisCache._setConfigForTests({ error4xxTtlMs: 1000 });
+    redisCache._setEnabledForTests(true);
+    redisCache._setClientForTests(client);
+    const url = 'https://www.chicksx.com/r';
+    client._z.set(url, Date.now() - 5000); // old, but 3xx never expires here
+    await client.hset('prerender:v1:status', url, 301);
+    const rows = await redisCache.status([url]);
+    assert.equal(rows[0].cached, true);
+    assert.equal(rows[0].status, 301);
+  });
+
+  it('stale() includes the per-URL status', async function () {
+    client._z.set('https://a/', 100);
+    await client.hset('prerender:v1:status', 'https://a/', 200);
+    const rows = await redisCache.stale({ limit: 5 });
+    assert.equal(rows[0].status, 200);
   });
 
   it('stale() returns oldest entries first', async function () {
@@ -513,6 +668,10 @@ describe('redisCache spaces store (CACHE_STORE=spaces)', function () {
         return Promise.resolve();
       },
       get: (key) => Promise.resolve(m.has(key) ? m.get(key) : null),
+      del: (key) => {
+        m.delete(key);
+        return Promise.resolve();
+      },
     };
   }
 
@@ -523,6 +682,9 @@ describe('redisCache spaces store (CACHE_STORE=spaces)', function () {
       eval: sandbox.stub().resolves(1), // lock release
       zadd: sandbox.stub().resolves(1), // index
       zscore: sandbox.stub().resolves(null),
+      hset: sandbox.stub().resolves(1), // per-URL status
+      zrem: sandbox.stub().resolves(1), // eviction
+      hdel: sandbox.stub().resolves(1), // eviction
     };
     store = makeStore();
     res = { send: sandbox.spy(), setHeader: sandbox.spy() };
@@ -596,5 +758,37 @@ describe('redisCache spaces store (CACHE_STORE=spaces)', function () {
     assert(next.calledOnce);
     assert(res.send.notCalled);
     assert.equal(req.prerender._cacheLockOwner, true);
+  });
+
+  it('reaps a stale 4xx body on read (lazy eviction)', async function () {
+    redisCache._setConfigForTests({
+      store: 'spaces',
+      compression: true,
+      error4xxTtlMs: 1000,
+    });
+    redisCache._setEnabledForTests(true);
+    redisCache._setClientForTests(client);
+    redisCache._setObjectStoreForTests(store);
+
+    const wreq = makeReq({
+      prerender: {
+        _cacheLockOwner: true,
+        statusCode: 404,
+        content: '<html>404</html>',
+      },
+    });
+    await redisCache.beforeSend(wreq, res, next);
+    const key = [...store._m.keys()][0];
+    // Backdate the stored timestamp beyond the TTL.
+    store._m.get(key).meta.storedat = String(Date.now() - 5000);
+
+    const rreq = makeReq();
+    await redisCache.requestReceived(rreq, res, next);
+    await new Promise((r) => setImmediate(r)); // flush the fire-and-forget evict
+
+    assert(res.send.notCalled); // expired -> treated as a miss
+    assert.equal(rreq.prerender._cacheLockOwner, true);
+    assert.equal(store._m.has(key), false); // body deleted
+    assert(client.zrem.called); // index entry removed
   });
 });
