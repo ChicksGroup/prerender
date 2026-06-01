@@ -858,3 +858,90 @@ describe('redisCache spaces store (CACHE_STORE=spaces)', function () {
     assert(client.zrem.called); // index entry removed
   });
 });
+
+describe('redisCache work queue', function () {
+  let sandbox, client;
+
+  // Minimal fake tuned for the queue ops: a single ZSET + an attempts HASH.
+  function makeQueueRedis() {
+    const z = new Map(); // member -> score
+    const h = new Map(); // attempt field -> count
+    return {
+      _z: z,
+      _h: h,
+      // zadd(key, 'NX', score, member)  OR  zadd(key, score, member)
+      zadd: (key, a, b, c) => {
+        if (a === 'NX') {
+          if (z.has(c)) return Promise.resolve(0);
+          z.set(c, Number(b));
+          return Promise.resolve(1);
+        }
+        z.set(b, Number(a));
+        return Promise.resolve(1);
+      },
+      zpopmin: (key, count) => {
+        const sorted = [...z.entries()].sort((x, y) => x[1] - y[1]).slice(0, count);
+        const out = [];
+        for (const [m, s] of sorted) {
+          out.push(m, String(s));
+          z.delete(m);
+        }
+        return Promise.resolve(out);
+      },
+      zcard: () => Promise.resolve(z.size),
+      hincrby: (key, field, n) => {
+        h.set(field, (h.get(field) || 0) + Number(n));
+        return Promise.resolve(h.get(field));
+      },
+      hdel: (key, field) => {
+        h.delete(field);
+        return Promise.resolve(1);
+      },
+    };
+  }
+
+  beforeEach(function () {
+    sandbox = sinon.createSandbox();
+    client = makeQueueRedis();
+    redisCache._reset();
+    redisCache._setConfigForTests({ queueMaxAttempts: 2 });
+    redisCache._setEnabledForTests(true);
+    redisCache._setClientForTests(client);
+  });
+
+  afterEach(function () {
+    sandbox.restore();
+    redisCache._reset();
+  });
+
+  it('enqueue adds new urls (NX dedups), dequeue pops by priority', async function () {
+    assert.equal(await redisCache.enqueue(['https://x/a', 'https://x/b'], 1), 2);
+    assert.equal(await redisCache.enqueue(['https://x/a'], 1), 0); // duplicate -> skipped
+    assert.equal(await redisCache.enqueue(['https://x/c'], 0), 1); // higher priority
+    assert.equal(await redisCache.queueDepth(), 3);
+    assert.deepEqual(await redisCache.dequeue(1), ['https://x/c']); // P0 before P1
+    assert.deepEqual((await redisCache.dequeue(10)).sort(), ['https://x/a', 'https://x/b']);
+    assert.equal(await redisCache.queueDepth(), 0);
+  });
+
+  it('requeue re-adds until queueMaxAttempts, then drops', async function () {
+    assert.equal(await redisCache.requeue('https://x/a'), true); // attempt 1 < 2
+    assert.equal(await redisCache.queueDepth(), 1);
+    await redisCache.dequeue(1);
+    assert.equal(await redisCache.requeue('https://x/a'), false); // attempt 2 >= 2 -> dropped
+    assert.equal(await redisCache.queueDepth(), 0);
+  });
+
+  it('clearAttempt resets the retry counter', async function () {
+    await redisCache.requeue('https://x/a'); // attempt 1
+    await redisCache.clearAttempt('https://x/a');
+    assert.equal(await redisCache.requeue('https://x/a'), true); // counted from 0 again
+  });
+
+  it('queue ops are a no-op when the cache is disabled', async function () {
+    redisCache._setEnabledForTests(false);
+    assert.equal(await redisCache.enqueue(['https://x/a'], 0), 0);
+    assert.deepEqual(await redisCache.dequeue(5), []);
+    assert.equal(await redisCache.queueDepth(), 0);
+  });
+});

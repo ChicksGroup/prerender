@@ -1,4 +1,5 @@
 const assert = require('assert');
+const sinon = require('sinon');
 const refresher = require('../lib/refresher');
 
 // A fake server exposing just what the refresher reads: the concurrency cap and
@@ -116,6 +117,68 @@ describe('refresher', function () {
   });
 });
 
+describe('refresher queue consumption', function () {
+  afterEach(function () {
+    refresher.stop();
+    delete process.env.REFRESHER_CONCURRENCY;
+  });
+
+  it('drains the queue first, then tops up with time-based refresh', async function () {
+    process.env.REFRESHER_CONCURRENCY = '4';
+    const launched = [];
+    const clearAttempt = sinon.spy();
+    refresher.start(makeServer(0), 3000, {
+      render: (u) => {
+        launched.push(u);
+        return Promise.resolve(200);
+      },
+      dequeue: (n) => Promise.resolve(['q1', 'q2'].slice(0, n)),
+      dueForRefresh: () => Promise.resolve(['r1']),
+      clearAttempt,
+      manual: true,
+    });
+    await refresher._tickOnce();
+    await new Promise((r) => setImmediate(r)); // let renders settle
+    assert.deepEqual(launched.sort(), ['q1', 'q2', 'r1']);
+    assert(clearAttempt.calledWith('q1')); // queue items clear their retry counter
+    assert(clearAttempt.calledWith('q2'));
+    assert(!clearAttempt.calledWith('r1')); // refresh items don't touch the queue
+  });
+
+  it('requeues a queue item whose render fails', async function () {
+    process.env.REFRESHER_CONCURRENCY = '4';
+    const requeue = sinon.spy();
+    refresher.start(makeServer(0), 3000, {
+      render: () => Promise.reject(new Error('boom')),
+      dequeue: (n) => Promise.resolve(['q1'].slice(0, n)),
+      dueForRefresh: () => Promise.resolve([]),
+      requeue,
+      manual: true,
+    });
+    await refresher._tickOnce();
+    await new Promise((r) => setImmediate(r));
+    assert(requeue.calledWith('q1'));
+  });
+
+  it('requeues a queue item that comes back 5xx', async function () {
+    process.env.REFRESHER_CONCURRENCY = '4';
+    const requeue = sinon.spy();
+    const clearAttempt = sinon.spy();
+    refresher.start(makeServer(0), 3000, {
+      render: () => Promise.resolve(504),
+      dequeue: (n) => Promise.resolve(['q1'].slice(0, n)),
+      dueForRefresh: () => Promise.resolve([]),
+      requeue,
+      clearAttempt,
+      manual: true,
+    });
+    await refresher._tickOnce();
+    await new Promise((r) => setImmediate(r));
+    assert(requeue.calledWith('q1'));
+    assert(!clearAttempt.calledWith('q1'));
+  });
+});
+
 describe('refresher adaptive concurrency', function () {
   function startAdaptive(min, max) {
     process.env.REFRESHER_ADAPTIVE = 'true';
@@ -201,5 +264,16 @@ describe('refresher adaptive concurrency', function () {
       123456,
     );
     assert.equal(refresher._parseCpuStatV2('no usage here'), null);
+  });
+
+  it('treats a slow render (near timeout) as a backoff signal', function () {
+    startAdaptive(1, 8); // slowMs defaults to 0.8 * 20000 = 16000ms
+    runWindow(10000, 10, 0); // fast renders (100ms) -> climb to 2
+    runWindow(20000, 30, 0); // -> 3
+    const before = refresher._getLimit();
+    assert.ok(before >= 2);
+    refresher._recordOutcome({ ok: true, status: 200, latencyMs: 50000 }); // slow 200
+    refresher._evaluate(30000);
+    assert.ok(refresher._getLimit() < before); // backed off despite the 200
   });
 });
