@@ -150,6 +150,24 @@ describe('redisCache plugin', function () {
       assert(next.calledOnce);
       assert.equal(req.prerender._cacheBypass, true);
     });
+
+    it('skips the read AND takes no lock on no-store (X-Prerender-No-Store header)', async function () {
+      const req = makeReq({ headers: { 'x-prerender-no-store': 'true' } });
+      await redisCache.requestReceived(req, res, next);
+      assert(client.get.notCalled); // no read
+      assert(client.set.notCalled); // no single-flight lock acquired
+      assert(next.calledOnce);
+      assert.equal(req.prerender._cacheNoStore, true);
+      assert.notEqual(req.prerender._cacheBypass, true); // distinct from bypass
+    });
+
+    it('skips the read on no-store via the noStore=true query param', async function () {
+      const req = makeReq({ query: { noStore: 'true' } });
+      await redisCache.requestReceived(req, res, next);
+      assert(client.get.notCalled);
+      assert(next.calledOnce);
+      assert.equal(req.prerender._cacheNoStore, true);
+    });
   });
 
   describe('write', function () {
@@ -302,6 +320,18 @@ describe('redisCache plugin', function () {
       await redisCache.beforeSend(req, res, next);
       assert(client.set.calledOnce);
       assert.equal(client.set.firstCall.args[0], HTML_KEY);
+    });
+
+    it('does not write on no-store, even with single-flight disabled', async function () {
+      // Without the explicit guard, singleFlight:false makes shouldWrite true.
+      redisCache._setConfigForTests({ singleFlight: false });
+      client.set.resolves('OK');
+      const req = makeReq({ prerender: { _cacheNoStore: true } });
+      await redisCache.beforeSend(req, res, next);
+      assert(client.set.notCalled); // no body write
+      assert(client.zadd.notCalled); // not added to the refresh index
+      assert(client.hset.notCalled); // no status entry
+      assert(next.calledOnce);
     });
 
     it('does not write when served from cache', async function () {
