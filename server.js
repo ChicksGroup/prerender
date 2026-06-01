@@ -22,7 +22,10 @@ server.use(prerender.redisCache());
 server.use(prerender.saasCacheClear());
 server.use(prerender.sendPrerenderHeader());
 server.use(prerender.browserForceRestart());
-// server.use(prerender.blockResources());
+// Abort image/font/media subresources (+ analytics/ads hosts) during render —
+// they never appear in the serialized HTML, so this cuts CDN egress and render
+// time. Keeps JS + CSS so the SPA's DOM still builds correctly.
+server.use(prerender.blockResources());
 server.use(prerender.addMetaTags());
 server.use(prerender.removeScriptTags());
 server.use(prerender.httpHeaders());
