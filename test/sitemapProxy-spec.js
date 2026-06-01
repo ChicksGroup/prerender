@@ -30,14 +30,29 @@ function makeRes() {
     statusCode: null,
     body: null,
     headers: {},
-    setHeader(k, v) { this.headers[k.toLowerCase()] = v; },
-    status(c) { this.statusCode = c; return this; },
-    send(b) { this.body = b; return this; },
-    sendStatus(c) { this.statusCode = c; this.body = null; return this; },
+    setHeader(k, v) {
+      this.headers[k.toLowerCase()] = v;
+    },
+    status(c) {
+      this.statusCode = c;
+      return this;
+    },
+    send(b) {
+      this.body = b;
+      return this;
+    },
+    sendStatus(c) {
+      this.statusCode = c;
+      this.body = null;
+      return this;
+    },
   };
 }
 
 describe('sitemapProxy', function () {
+  beforeEach(function () {
+    sitemapProxy._setCacheForTests({ client: null }); // no real Redis in unit tests
+  });
   afterEach(function () {
     sitemapProxy._setConfigForTests(); // reparse defaults
     sitemapProxy._setFetchForTests(null); // restore real fetch
@@ -59,16 +74,31 @@ describe('sitemapProxy', function () {
     it('extracts ordered locs and XML-unescapes &amp;', function () {
       const locs = sitemapProxy.parseSitemapLocs(INDEX_XML);
       assert.equal(locs.length, 8);
-      assert.equal(locs[0].loc, 'https://api.chicksgroup.com/Sitemap?websiteShortCode=CX&page=1');
-      assert.equal(locs[7].loc, 'https://api.chicksgroup.com/Sitemap?websiteShortCode=CX&page=8');
+      assert.equal(
+        locs[0].loc,
+        'https://api.chicksgroup.com/Sitemap?websiteShortCode=CX&page=1',
+      );
+      assert.equal(
+        locs[7].loc,
+        'https://api.chicksgroup.com/Sitemap?websiteShortCode=CX&page=8',
+      );
     });
   });
 
   describe('renderIndex', function () {
     it('rewrites children to public per-page URLs (1-based)', function () {
-      const xml = sitemapProxy.renderIndex('chicksx.com', sitemapProxy.parseSitemapLocs(INDEX_XML));
-      assert.ok(xml.indexOf('<loc>https://chicksx.com/sitemap/sitemap-1.xml</loc>') > -1);
-      assert.ok(xml.indexOf('<loc>https://chicksx.com/sitemap/sitemap-8.xml</loc>') > -1);
+      const xml = sitemapProxy.renderIndex(
+        'chicksx.com',
+        sitemapProxy.parseSitemapLocs(INDEX_XML),
+      );
+      assert.ok(
+        xml.indexOf('<loc>https://chicksx.com/sitemap/sitemap-1.xml</loc>') >
+          -1,
+      );
+      assert.ok(
+        xml.indexOf('<loc>https://chicksx.com/sitemap/sitemap-8.xml</loc>') >
+          -1,
+      );
       assert.ok(xml.indexOf('api.chicksgroup.com') === -1); // no API URLs leak through
       assert.equal((xml.match(/<sitemap>/g) || []).length, 8);
     });
@@ -81,7 +111,9 @@ describe('sitemapProxy', function () {
       await sitemapProxy.index(makeReq('www.chicksx.com'), res);
       assert.equal(res.statusCode, 200);
       assert.ok(/application\/xml/.test(res.headers['content-type']));
-      assert.ok(res.body.indexOf('https://chicksx.com/sitemap/sitemap-1.xml') > -1);
+      assert.ok(
+        res.body.indexOf('https://chicksx.com/sitemap/sitemap-1.xml') > -1,
+      );
     });
 
     it('uses X-Website-Code header to pick the site, ignoring the request Host', async function () {
@@ -89,18 +121,28 @@ describe('sitemapProxy', function () {
       // and the public host is reverse-mapped from the code for the rewrite.
       sitemapProxy._setFetchForTests(() => Promise.resolve(INDEX_XML));
       const res = makeRes();
-      await sitemapProxy.index(makeReq('prerender.chicksgroup.com', { 'x-website-code': 'CX' }), res);
+      await sitemapProxy.index(
+        makeReq('prerender.chicksgroup.com', { 'x-website-code': 'CX' }),
+        res,
+      );
       assert.equal(res.statusCode, 200);
-      assert.ok(res.body.indexOf('https://chicksx.com/sitemap/sitemap-1.xml') > -1);
+      assert.ok(
+        res.body.indexOf('https://chicksx.com/sitemap/sitemap-1.xml') > -1,
+      );
       assert.ok(res.body.indexOf('prerender.chicksgroup.com') === -1);
     });
 
     it('uses the ?websiteCode= query as a fallback to the header', async function () {
       sitemapProxy._setFetchForTests(() => Promise.resolve(INDEX_XML));
       const res = makeRes();
-      await sitemapProxy.index(makeReq('prerender.chicksgroup.com', {}, { websiteCode: 'CX' }), res);
+      await sitemapProxy.index(
+        makeReq('prerender.chicksgroup.com', {}, { websiteCode: 'CX' }),
+        res,
+      );
       assert.equal(res.statusCode, 200);
-      assert.ok(res.body.indexOf('https://chicksx.com/sitemap/sitemap-1.xml') > -1);
+      assert.ok(
+        res.body.indexOf('https://chicksx.com/sitemap/sitemap-1.xml') > -1,
+      );
     });
 
     it('dev environment fetches the dev API and rewrites to the dev. host', async function () {
@@ -111,12 +153,21 @@ describe('sitemapProxy', function () {
       });
       const res = makeRes();
       await sitemapProxy.index(
-        makeReq('prerender.chicksgroup.com', { 'x-website-code': 'CX', 'x-environment': 'dev' }),
+        makeReq('prerender.chicksgroup.com', {
+          'x-website-code': 'CX',
+          'x-environment': 'dev',
+        }),
         res,
       );
       assert.equal(res.statusCode, 200);
-      assert.ok(fetchedUrl.indexOf('https://dev-api.chicksgroup.com/Sitemap/SitemapIndex') === 0);
-      assert.ok(res.body.indexOf('https://dev.chicksx.com/sitemap/sitemap-1.xml') > -1);
+      assert.ok(
+        fetchedUrl.indexOf(
+          'https://dev-api.chicksgroup.com/Sitemap/SitemapIndex',
+        ) === 0,
+      );
+      assert.ok(
+        res.body.indexOf('https://dev.chicksx.com/sitemap/sitemap-1.xml') > -1,
+      );
       assert.ok(res.body.indexOf('https://chicksx.com/sitemap') === -1); // no apex leak
     });
 
@@ -128,17 +179,28 @@ describe('sitemapProxy', function () {
       });
       const res = makeRes();
       await sitemapProxy.index(
-        makeReq('prerender.chicksgroup.com', { 'x-website-code': 'CX', 'x-environment': 'staging' }),
+        makeReq('prerender.chicksgroup.com', {
+          'x-website-code': 'CX',
+          'x-environment': 'staging',
+        }),
         res,
       );
       assert.equal(res.statusCode, 200);
-      assert.ok(fetchedUrl.indexOf('https://staging-api.chicksgroup.com/') === 0);
-      assert.ok(res.body.indexOf('https://staging.chicksx.com/sitemap/sitemap-1.xml') > -1);
+      assert.ok(
+        fetchedUrl.indexOf('https://staging-api.chicksgroup.com/') === 0,
+      );
+      assert.ok(
+        res.body.indexOf('https://staging.chicksx.com/sitemap/sitemap-1.xml') >
+          -1,
+      );
     });
 
     it('404s an unknown host (no fetch)', async function () {
       let fetched = false;
-      sitemapProxy._setFetchForTests(() => { fetched = true; return Promise.resolve(INDEX_XML); });
+      sitemapProxy._setFetchForTests(() => {
+        fetched = true;
+        return Promise.resolve(INDEX_XML);
+      });
       const res = makeRes();
       await sitemapProxy.index(makeReq('example.com'), res);
       assert.equal(res.statusCode, 404);
@@ -172,7 +234,11 @@ describe('sitemapProxy', function () {
     it('resolves the site from X-Website-Code (proxy Host) and passes the page through', async function () {
       sitemapProxy._setFetchForTests(routedFetch);
       const res = makeRes();
-      await sitemapProxy.page(makeReq('prerender.chicksgroup.com', { 'x-website-code': 'CX' }), res, 3);
+      await sitemapProxy.page(
+        makeReq('prerender.chicksgroup.com', { 'x-website-code': 'CX' }),
+        res,
+        3,
+      );
       assert.equal(res.statusCode, 200);
       assert.equal(res.body, PAGE3_XML);
     });
@@ -190,5 +256,126 @@ describe('sitemapProxy', function () {
       await sitemapProxy.page(makeReq('example.com'), res, 1);
       assert.equal(res.statusCode, 404);
     });
+  });
+});
+
+describe('sitemapProxy caching', function () {
+  const crypto = require('crypto');
+
+  // Minimal in-memory Redis: get / set (PX, NX) / eval(release), with expiry
+  // evaluated against the injected test clock.
+  function makeFakeRedis(clock) {
+    const m = new Map(); // key -> { v, exp|null }
+    const live = (k) => {
+      const e = m.get(k);
+      if (!e) return null;
+      if (e.exp != null && clock.t >= e.exp) {
+        m.delete(k);
+        return null;
+      }
+      return e;
+    };
+    return {
+      get: (k) => {
+        const e = live(k);
+        return Promise.resolve(e ? e.v : null);
+      },
+      set: (k, v, ...args) => {
+        let exp = null;
+        let nx = false;
+        for (let i = 0; i < args.length; i++) {
+          if (args[i] === 'PX') {
+            exp = clock.t + args[i + 1];
+            i++;
+          } else if (args[i] === 'NX') {
+            nx = true;
+          }
+        }
+        if (nx && live(k)) return Promise.resolve(null);
+        m.set(k, { v, exp });
+        return Promise.resolve('OK');
+      },
+      eval: (_lua, _n, key, arg) => {
+        const e = live(key);
+        if (e && e.v === arg) {
+          m.delete(key);
+          return Promise.resolve(1);
+        }
+        return Promise.resolve(0);
+      },
+    };
+  }
+
+  const lockKeyFor = (url) =>
+    'prerender:v1:sitemaplock:' +
+    crypto.createHash('sha1').update(url).digest('hex');
+
+  const TTL = 6 * 3600 * 1000;
+  const URLX =
+    'https://api.chicksgroup.com/Sitemap/SitemapIndex?websiteShortCode=CX';
+  let clock, redis, calls;
+
+  beforeEach(function () {
+    clock = { t: 1000 };
+    redis = makeFakeRedis(clock);
+    calls = [];
+    sitemapProxy._setConfigForTests({
+      cacheTtlMs: TTL,
+      cacheStaleTtlMs: 24 * 3600 * 1000,
+      cacheWaitMaxMs: 1000,
+      timeoutMs: 15000,
+      cacheKeyPrefix: 'prerender',
+    });
+    sitemapProxy._setCacheForTests({ client: redis, now: () => clock.t });
+    sitemapProxy._setFetchForTests((url) => {
+      calls.push(url);
+      return Promise.resolve('<xml>' + url + '</xml>');
+    });
+  });
+
+  afterEach(function () {
+    sitemapProxy._setCacheForTests({ client: null });
+    sitemapProxy._setFetchForTests(null);
+    sitemapProxy._setConfigForTests();
+  });
+
+  it('fetches once on a miss, then serves from cache within the TTL', async function () {
+    const a = await sitemapProxy._cachedFetch(URLX);
+    const b = await sitemapProxy._cachedFetch(URLX);
+    assert.equal(a, '<xml>' + URLX + '</xml>');
+    assert.equal(b, a);
+    assert.equal(calls.length, 1);
+  });
+
+  it('refetches once the TTL expires', async function () {
+    await sitemapProxy._cachedFetch(URLX);
+    clock.t += TTL + 1;
+    await sitemapProxy._cachedFetch(URLX);
+    assert.equal(calls.length, 2);
+  });
+
+  it('serves the stale copy when a refetch errors (serve-stale-on-error)', async function () {
+    await sitemapProxy._cachedFetch(URLX); // warm
+    clock.t += TTL + 1;
+    sitemapProxy._setFetchForTests(() => Promise.reject(new Error('DB down')));
+    const v = await sitemapProxy._cachedFetch(URLX);
+    assert.equal(v, '<xml>' + URLX + '</xml>'); // last good copy
+  });
+
+  it('serves stale without refetching when another worker holds the lock', async function () {
+    await sitemapProxy._cachedFetch(URLX); // warm (1 call)
+    clock.t += TTL + 1; // expire freshness
+    await redis.set(lockKeyFor(URLX), 'other-worker', 'PX', 20000, 'NX');
+    const before = calls.length;
+    const v = await sitemapProxy._cachedFetch(URLX);
+    assert.equal(v, '<xml>' + URLX + '</xml>');
+    assert.equal(calls.length, before); // no new origin hit
+  });
+
+  it('degrades to a direct fetch when caching is disabled', async function () {
+    sitemapProxy._setCacheForTests({ client: null });
+    const v = await sitemapProxy._cachedFetch('https://api/y');
+    assert.equal(v, '<xml>https://api/y</xml>');
+    assert.equal(calls.length, 1);
   });
 });
