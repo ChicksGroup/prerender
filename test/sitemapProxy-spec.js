@@ -103,6 +103,39 @@ describe('sitemapProxy', function () {
       assert.ok(res.body.indexOf('https://chicksx.com/sitemap/sitemap-1.xml') > -1);
     });
 
+    it('dev environment fetches the dev API and rewrites to the dev. host', async function () {
+      let fetchedUrl = null;
+      sitemapProxy._setFetchForTests((url) => {
+        fetchedUrl = url;
+        return Promise.resolve(INDEX_XML);
+      });
+      const res = makeRes();
+      await sitemapProxy.index(
+        makeReq('prerender.chicksgroup.com', { 'x-website-code': 'CX', 'x-environment': 'dev' }),
+        res,
+      );
+      assert.equal(res.statusCode, 200);
+      assert.ok(fetchedUrl.indexOf('https://dev-api.chicksgroup.com/Sitemap/SitemapIndex') === 0);
+      assert.ok(res.body.indexOf('https://dev.chicksx.com/sitemap/sitemap-1.xml') > -1);
+      assert.ok(res.body.indexOf('https://chicksx.com/sitemap') === -1); // no apex leak
+    });
+
+    it('staging environment fetches the staging API and rewrites to the staging. host', async function () {
+      let fetchedUrl = null;
+      sitemapProxy._setFetchForTests((url) => {
+        fetchedUrl = url;
+        return Promise.resolve(INDEX_XML);
+      });
+      const res = makeRes();
+      await sitemapProxy.index(
+        makeReq('prerender.chicksgroup.com', { 'x-website-code': 'CX', 'x-environment': 'staging' }),
+        res,
+      );
+      assert.equal(res.statusCode, 200);
+      assert.ok(fetchedUrl.indexOf('https://staging-api.chicksgroup.com/') === 0);
+      assert.ok(res.body.indexOf('https://staging.chicksx.com/sitemap/sitemap-1.xml') > -1);
+    });
+
     it('404s an unknown host (no fetch)', async function () {
       let fetched = false;
       sitemapProxy._setFetchForTests(() => { fetched = true; return Promise.resolve(INDEX_XML); });
