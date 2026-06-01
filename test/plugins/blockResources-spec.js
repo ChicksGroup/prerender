@@ -82,6 +82,42 @@ describe('blockResources plugin', function () {
       );
     });
 
+    it('blocks modern analytics / tag managers / pixels / chat / recorders', function () {
+      const blocked = [
+        'https://www.googletagmanager.com/gtm.js?id=GTM-XXXX',
+        'https://www.googletagmanager.com/gtag/js?id=G-XXXX',
+        'https://analytics.google.com/g/collect?v=2',
+        'https://www.google.com/g/collect?v=2', // GA beacon on www.google.com via the path
+        'https://www.google.com/ccm/collect?',
+        'https://connect.facebook.net/en_US/fbevents.js',
+        'https://www.facebook.com/tr/?id=123',
+        'https://bat.bing.com/bat.js',
+        'https://www.clarity.ms/tag/abc',
+        'https://n.clarity.ms/collect',
+        'https://static.cloudflareinsights.com/beacon.min.js',
+        'https://widget.intercom.io/widget/abc',
+        'https://www.redditstatic.com/ads/pixel.js',
+        'https://js.jam.dev/recorder.js',
+      ];
+      blocked.forEach((u) =>
+        assert.strictEqual(shouldBlockRequest('Script', u), true, u),
+      );
+    });
+
+    it('does NOT block first-party assets or the content API (must keep rendering)', function () {
+      const allowed = [
+        'https://chicksgold.com/buy/skins/dota2/hat-of-the-howling-wolf', // page
+        'https://chicksgold.com/chicksgroup~9f5ed9db.abc.bundle.js', // JS bundle
+        'https://chicksgold.com/app~378b5940.def.bundle.css', // CSS bundle
+        'https://api.chicksgroup.com/Product/foo?', // content API
+        'https://signalr.chicksgroup.com/signalRHub?', // realtime
+        'https://chicksgold.com/cdn-cgi/challenge-platform/scripts/jsd/main.js', // CF challenge — must NOT be blocked
+      ];
+      allowed.forEach((u) =>
+        assert.strictEqual(shouldBlockRequest('Script', u), false, u),
+      );
+    });
+
     it('blocks the Google Fonts stylesheet (targeted) but allows first-party CSS', function () {
       assert.strictEqual(
         shouldBlockRequest(
