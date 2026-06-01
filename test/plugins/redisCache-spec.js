@@ -515,6 +515,72 @@ describe('redisCache introspection & guards', function () {
     assert.equal(rows[0].status, 200);
   });
 
+  it('dueForRefresh() returns oldest 2xx older than the refresh TTL', async function () {
+    const now = Date.now();
+    client._z.set('https://a/', now - 2 * 86400e3); // 2d old 2xx -> due
+    client._z.set('https://b/', now - 60e3); // fresh 2xx -> not due
+    await client.hset('prerender:v1:status', 'https://a/', 200);
+    await client.hset('prerender:v1:status', 'https://b/', 200);
+    const due = await redisCache.dueForRefresh({
+      limit: 10,
+      refreshTtlMs: 86400e3,
+      redirectTtlMs: 7 * 86400e3,
+      now,
+    });
+    assert.deepEqual(due, ['https://a/']);
+  });
+
+  it('dueForRefresh() uses the 7d window for 3xx', async function () {
+    const now = Date.now();
+    client._z.set('https://r2d/', now - 2 * 86400e3); // 2d old 3xx -> NOT due
+    client._z.set('https://r8d/', now - 8 * 86400e3); // 8d old 3xx -> due
+    await client.hset('prerender:v1:status', 'https://r2d/', 301);
+    await client.hset('prerender:v1:status', 'https://r8d/', 302);
+    const due = await redisCache.dueForRefresh({
+      limit: 10,
+      refreshTtlMs: 86400e3,
+      redirectTtlMs: 7 * 86400e3,
+      now,
+    });
+    assert.deepEqual(due, ['https://r8d/']);
+  });
+
+  it('dueForRefresh() never returns a 4xx', async function () {
+    const now = Date.now();
+    client._z.set('https://e/', now - 100 * 86400e3); // ancient 4xx -> still skipped
+    await client.hset('prerender:v1:status', 'https://e/', 404);
+    const due = await redisCache.dueForRefresh({
+      limit: 10,
+      refreshTtlMs: 86400e3,
+      redirectTtlMs: 7 * 86400e3,
+      now,
+    });
+    assert.deepEqual(due, []);
+  });
+
+  it('dueForRefresh() honors the exclude set and the limit (oldest first)', async function () {
+    const now = Date.now();
+    client._z.set('https://a/', now - 2 * 86400e3);
+    client._z.set('https://b/', now - 3 * 86400e3); // older
+    await client.hset('prerender:v1:status', 'https://a/', 200);
+    await client.hset('prerender:v1:status', 'https://b/', 200);
+    const excluded = await redisCache.dueForRefresh({
+      limit: 10,
+      exclude: new Set(['https://b/']),
+      refreshTtlMs: 86400e3,
+      redirectTtlMs: 7 * 86400e3,
+      now,
+    });
+    assert.deepEqual(excluded, ['https://a/']);
+    const oldestOne = await redisCache.dueForRefresh({
+      limit: 1,
+      refreshTtlMs: 86400e3,
+      redirectTtlMs: 7 * 86400e3,
+      now,
+    });
+    assert.deepEqual(oldestOne, ['https://b/']); // oldest-first
+  });
+
   it('stale() returns oldest entries first', async function () {
     client._z.set('https://a/', 100);
     client._z.set('https://b/', 300);
