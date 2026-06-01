@@ -18,8 +18,12 @@ const PAGE3_XML =
   '<?xml version="1.0" encoding="utf-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">' +
   '<url><loc>https://chicksx.com/swap/cvx-to-imx</loc></url></urlset>';
 
-function makeReq(host) {
-  return { hostname: host, headers: { host: host } };
+function makeReq(host, headers, query) {
+  return {
+    hostname: host,
+    headers: Object.assign({ host: host }, headers || {}),
+    query: query || {},
+  };
 }
 function makeRes() {
   return {
@@ -80,6 +84,25 @@ describe('sitemapProxy', function () {
       assert.ok(res.body.indexOf('https://chicksx.com/sitemap/sitemap-1.xml') > -1);
     });
 
+    it('uses X-Website-Code header to pick the site, ignoring the request Host', async function () {
+      // Behind nginx the Host is the proxy host; the code comes via the header,
+      // and the public host is reverse-mapped from the code for the rewrite.
+      sitemapProxy._setFetchForTests(() => Promise.resolve(INDEX_XML));
+      const res = makeRes();
+      await sitemapProxy.index(makeReq('prerender.chicksgroup.com', { 'x-website-code': 'CX' }), res);
+      assert.equal(res.statusCode, 200);
+      assert.ok(res.body.indexOf('https://chicksx.com/sitemap/sitemap-1.xml') > -1);
+      assert.ok(res.body.indexOf('prerender.chicksgroup.com') === -1);
+    });
+
+    it('uses the ?websiteCode= query as a fallback to the header', async function () {
+      sitemapProxy._setFetchForTests(() => Promise.resolve(INDEX_XML));
+      const res = makeRes();
+      await sitemapProxy.index(makeReq('prerender.chicksgroup.com', {}, { websiteCode: 'CX' }), res);
+      assert.equal(res.statusCode, 200);
+      assert.ok(res.body.indexOf('https://chicksx.com/sitemap/sitemap-1.xml') > -1);
+    });
+
     it('404s an unknown host (no fetch)', async function () {
       let fetched = false;
       sitemapProxy._setFetchForTests(() => { fetched = true; return Promise.resolve(INDEX_XML); });
@@ -111,6 +134,14 @@ describe('sitemapProxy', function () {
       assert.equal(res.statusCode, 200);
       assert.equal(res.body, PAGE3_XML); // unchanged, no inner rewrite
       assert.ok(/application\/xml/.test(res.headers['content-type']));
+    });
+
+    it('resolves the site from X-Website-Code (proxy Host) and passes the page through', async function () {
+      sitemapProxy._setFetchForTests(routedFetch);
+      const res = makeRes();
+      await sitemapProxy.page(makeReq('prerender.chicksgroup.com', { 'x-website-code': 'CX' }), res, 3);
+      assert.equal(res.statusCode, 200);
+      assert.equal(res.body, PAGE3_XML);
     });
 
     it('404s an out-of-range page', async function () {
