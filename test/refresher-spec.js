@@ -115,3 +115,91 @@ describe('refresher', function () {
     assert.ok(r.stopped);
   });
 });
+
+describe('refresher adaptive concurrency', function () {
+  function startAdaptive(min, max) {
+    process.env.REFRESHER_ADAPTIVE = 'true';
+    process.env.REFRESHER_MIN_CONCURRENCY = String(min);
+    process.env.REFRESHER_CONCURRENCY = String(max);
+    // now:()=>0 pins the initial window start; we pass explicit timestamps to _evaluate.
+    refresher.start(makeServer(0), 3000, {
+      render: () => Promise.resolve(200),
+      dueForRefresh: () => Promise.resolve([]),
+      now: () => 0,
+      manual: true,
+    });
+  }
+  // Run one evaluation window: N completed + M failed renders, then evaluate at `at`.
+  function runWindow(at, completed, failed) {
+    for (let i = 0; i < completed; i += 1) {
+      refresher._recordOutcome({ ok: true, status: 200, latencyMs: 100 });
+    }
+    for (let i = 0; i < (failed || 0); i += 1) refresher._recordOutcome({ ok: false });
+    refresher._evaluate(at);
+  }
+
+  afterEach(function () {
+    refresher.stop();
+    delete process.env.REFRESHER_ADAPTIVE;
+    delete process.env.REFRESHER_MIN_CONCURRENCY;
+    delete process.env.REFRESHER_CONCURRENCY;
+  });
+
+  it('climbs while throughput keeps improving', function () {
+    startAdaptive(1, 6);
+    assert.equal(refresher._getLimit(), 1);
+    runWindow(10000, 5, 0); // 0.5/s > 0 -> climb
+    assert.equal(refresher._getLimit(), 2);
+    runWindow(20000, 30, 0); // 3.0/s > prev -> climb
+    assert.equal(refresher._getLimit(), 3);
+  });
+
+  it('halves the limit on a render failure', function () {
+    startAdaptive(1, 8);
+    runWindow(10000, 10, 0); // -> 2
+    runWindow(20000, 30, 0); // -> 3
+    runWindow(30000, 50, 0); // -> 4
+    assert.equal(refresher._getLimit(), 4);
+    runWindow(40000, 5, 2); // failures -> floor(4 * 0.5) = 2
+    assert.equal(refresher._getLimit(), 2);
+  });
+
+  it('steps back and holds when a higher limit does not improve throughput', function () {
+    startAdaptive(1, 6);
+    runWindow(10000, 10, 0); // 1.0/s -> climb to 2 (revert target = 1)
+    assert.equal(refresher._getLimit(), 2);
+    runWindow(20000, 10, 0); // still 1.0/s, no gain -> revert to 1, hold
+    assert.equal(refresher._getLimit(), 1);
+  });
+
+  it('does not collapse the limit during an idle window', function () {
+    startAdaptive(1, 6);
+    runWindow(10000, 10, 0); // -> 2
+    runWindow(20000, 30, 0); // -> 3
+    assert.equal(refresher._getLimit(), 3);
+    refresher._evaluate(30000); // no renders this window -> no signal, hold
+    assert.equal(refresher._getLimit(), 3);
+  });
+
+  it('is a no-op (static limit) when REFRESHER_ADAPTIVE is off', function () {
+    process.env.REFRESHER_CONCURRENCY = '5';
+    refresher.start(makeServer(0), 3000, {
+      render: () => Promise.resolve(200),
+      dueForRefresh: () => Promise.resolve([]),
+      manual: true,
+    });
+    assert.equal(refresher._getLimit(), 5);
+    refresher._recordOutcome({ ok: false });
+    refresher._evaluate(10000);
+    assert.equal(refresher._getLimit(), 5); // unchanged
+    delete process.env.REFRESHER_CONCURRENCY;
+  });
+
+  it('parses usage_usec from a cgroup v2 cpu.stat', function () {
+    assert.equal(
+      refresher._parseCpuStatV2('usage_usec 123456\nuser_usec 1\nsystem_usec 2\n'),
+      123456,
+    );
+    assert.equal(refresher._parseCpuStatV2('no usage here'), null);
+  });
+});
