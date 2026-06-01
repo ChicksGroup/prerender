@@ -1005,3 +1005,83 @@ describe('redisCache work queue', function () {
     assert.equal(await redisCache.queueDepth(), 0);
   });
 });
+
+describe('redisCache flush (admin reset)', function () {
+  let sandbox, client, store;
+
+  // SCAN returns a single page per pattern, then cursor '0'.
+  const scanPages = {
+    'prerender:v1:html:*': ['prerender:v1:html:a', 'prerender:v1:html:b', 'prerender:v1:html:c'],
+    'prerender:v1:lock:*': ['prerender:v1:lock:a'],
+    'prerender:v1:metrics:*': ['prerender:v1:metrics:ondemand', 'prerender:v1:metrics:scheduled'],
+  };
+
+  function makeFlushRedis() {
+    return {
+      scan: (cursor, _m, pattern) => Promise.resolve(['0', scanPages[pattern] || []]),
+      del: sandbox.stub().resolves(1),
+      unlink: sandbox.stub().resolves(1),
+    };
+  }
+  function makeStore() {
+    return { deleteAllUnderPrefix: sandbox.stub().resolves(42) };
+  }
+
+  beforeEach(function () {
+    sandbox = sinon.createSandbox();
+    client = makeFlushRedis();
+    store = makeStore();
+    redisCache._reset();
+    redisCache._setEnabledForTests(true);
+    redisCache._setClientForTests(client);
+  });
+
+  afterEach(function () {
+    sandbox.restore();
+    redisCache._reset();
+  });
+
+  it('cache scope on Spaces deletes bodies via the object store + structural keys', async function () {
+    redisCache._setConfigForTests({ store: 'spaces' });
+    redisCache._setEnabledForTests(true);
+    redisCache._setClientForTests(client);
+    redisCache._setObjectStoreForTests(store);
+
+    const r = await redisCache.flush({ cache: true });
+    assert.equal(r.store, 'spaces');
+    assert.equal(r.bodies, 42); // from objectStore.deleteAllUnderPrefix
+    assert(store.deleteAllUnderPrefix.calledWith('v1/html/')); // prefix '' + v1/html/
+    // 4 structural DELs (index/status/queue/attempts) + 1 scanned lock key
+    assert.equal(r.structuralKeys, 5);
+    assert.equal(r.metricsLabels, 0); // metrics untouched
+  });
+
+  it('cache scope on the Redis store deletes html keys via SCAN', async function () {
+    redisCache._setConfigForTests({ store: 'redis' });
+    redisCache._setEnabledForTests(true);
+    redisCache._setClientForTests(client);
+
+    const r = await redisCache.flush({ cache: true });
+    assert.equal(r.store, 'redis');
+    assert.equal(r.bodies, 3); // 3 html keys from SCAN
+    assert.equal(r.structuralKeys, 5);
+  });
+
+  it('metrics scope clears every per-label metrics HASH only', async function () {
+    redisCache._setConfigForTests({ store: 'spaces' });
+    redisCache._setEnabledForTests(true);
+    redisCache._setClientForTests(client);
+    redisCache._setObjectStoreForTests(store);
+
+    const r = await redisCache.flush({ metrics: true });
+    assert.equal(r.metricsLabels, 2);
+    assert.equal(r.bodies, 0); // cache untouched
+    assert.equal(r.structuralKeys, 0);
+    assert(store.deleteAllUnderPrefix.notCalled);
+  });
+
+  it('throws when the cache is disabled', async function () {
+    redisCache._setEnabledForTests(false);
+    await assert.rejects(() => redisCache.flush({ cache: true }), /cache disabled/);
+  });
+});
