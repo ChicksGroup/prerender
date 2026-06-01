@@ -1,0 +1,117 @@
+const assert = require('assert');
+const refresher = require('../lib/refresher');
+
+// A fake server exposing just what the refresher reads: the concurrency cap and
+// the in-flight Map (its size is the live load signal).
+function makeServer(max, inFlight) {
+  const m = new Map();
+  for (let i = 0; i < (inFlight || 0); i += 1) m.set('r' + i, 'u');
+  return {
+    options: { maxConcurrentRenders: max },
+    browserRequestsInFlight: m,
+    isShuttingDown: false,
+  };
+}
+
+// A render that never settles, so launched URLs stay "in progress" for assertions.
+function pendingRender() {
+  return new Promise(() => {});
+}
+
+describe('refresher', function () {
+  afterEach(function () {
+    refresher.stop();
+    delete process.env.REFRESHER_CONCURRENCY;
+  });
+
+  it('launches up to REFRESHER_CONCURRENCY and no more', async function () {
+    process.env.REFRESHER_CONCURRENCY = '2';
+    const calls = [];
+    const render = (url) => {
+      calls.push(url);
+      return pendingRender();
+    };
+    const due = ({ limit, exclude }) =>
+      Promise.resolve(
+        ['a', 'b', 'c', 'd'].filter((u) => !exclude.has(u)).slice(0, limit),
+      );
+    refresher.start(makeServer(0), 3000, {
+      render,
+      dueForRefresh: due,
+      manual: true,
+    });
+
+    await refresher._tickOnce();
+    assert.equal(refresher._inProgress().size, 2); // capped at concurrency
+    assert.deepEqual(calls.sort(), ['a', 'b']);
+  });
+
+  it('respects box capacity (maxConcurrentRenders - inFlight)', async function () {
+    process.env.REFRESHER_CONCURRENCY = '10';
+    const due = ({ limit }) =>
+      Promise.resolve(['a', 'b', 'c', 'd', 'e'].slice(0, limit));
+    // box max 4 with 3 already in flight -> only 1 free slot
+    refresher.start(makeServer(4, 3), 3000, {
+      render: pendingRender,
+      dueForRefresh: due,
+      manual: true,
+    });
+    await refresher._tickOnce();
+    assert.equal(refresher._inProgress().size, 1);
+  });
+
+  it('forwards in-progress URLs as the exclude set', async function () {
+    process.env.REFRESHER_CONCURRENCY = '4';
+    let lastExclude = null;
+    const due = ({ limit, exclude }) => {
+      lastExclude = exclude;
+      return Promise.resolve(
+        ['a', 'b'].filter((u) => !exclude.has(u)).slice(0, limit),
+      );
+    };
+    refresher.start(makeServer(0), 3000, {
+      render: pendingRender,
+      dueForRefresh: due,
+      manual: true,
+    });
+    await refresher._tickOnce(); // launches a, b
+    assert.equal(refresher._inProgress().size, 2);
+    await refresher._tickOnce(); // a, b excluded -> nothing new
+    assert.ok(lastExclude.has('a') && lastExclude.has('b'));
+    assert.equal(refresher._inProgress().size, 2);
+  });
+
+  it('removes a URL from in-progress once its render settles', async function () {
+    process.env.REFRESHER_CONCURRENCY = '2';
+    let resolveRender;
+    const render = () =>
+      new Promise((res) => {
+        resolveRender = res;
+      });
+    const due = ({ limit, exclude }) =>
+      Promise.resolve(['a'].filter((u) => !exclude.has(u)).slice(0, limit));
+    refresher.start(makeServer(0), 3000, {
+      render,
+      dueForRefresh: due,
+      manual: true,
+    });
+    await refresher._tickOnce();
+    assert.deepEqual([...refresher._inProgress()], ['a']);
+    resolveRender(200);
+    await new Promise((r) => setImmediate(r)); // flush the launch .then chain
+    assert.equal(refresher._inProgress().size, 0);
+  });
+
+  it('does nothing while shutting down', async function () {
+    const srv = makeServer(0);
+    srv.isShuttingDown = true;
+    refresher.start(srv, 3000, {
+      render: () => Promise.resolve(200),
+      dueForRefresh: () => Promise.resolve(['a', 'b']),
+      manual: true,
+    });
+    const r = await refresher._tickOnce();
+    assert.equal(refresher._inProgress().size, 0);
+    assert.ok(r.stopped);
+  });
+});
