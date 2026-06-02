@@ -859,7 +859,7 @@ describe('redisCache introspection & guards', function () {
     assert.equal(r.policy['4xx'].cache, false);
     assert.ok(client._kv.has('prerender:v1:policy'));
     const stored = JSON.parse(client._kv.get('prerender:v1:policy'));
-    assert.equal(stored['4xx'].cache, false);
+    assert.equal(stored.classes['4xx'].cache, false);
     const g = await redisCache.getPolicy();
     assert.equal(g.policy['2xx'].ttlHours, 48);
     assert.equal(g.policy['4xx'].cache, false);
@@ -964,6 +964,146 @@ describe('redisCache introspection & guards', function () {
     const rows = await redisCache.status([url]);
     assert.equal(rows[0].cached, true);
     assert.equal(rows[0].status, 404);
+  });
+
+  it('setPolicy persists URL rules ({classes,rules}) and getPolicy returns them', async function () {
+    const r = await redisCache.setPolicy({
+      '2xx': { cache: true, ttlHours: 24, onExpiry: 'refresh' },
+      rules: [
+        { pattern: '/sell/', ttlHours: 2, onExpiry: 'drop', cache: true },
+      ],
+    });
+    assert.equal(r.rules.length, 1);
+    assert.equal(r.rules[0].pattern, '/sell/');
+    assert.equal(r.rules[0].ttlHours, 2);
+    assert.equal(r.rules[0].onExpiry, 'drop');
+    assert.ok(r.rules[0].id);
+    const stored = JSON.parse(client._kv.get('prerender:v1:policy'));
+    assert.ok(stored.classes && stored.classes['2xx']);
+    assert.equal(stored.rules.length, 1);
+    const g = await redisCache.getPolicy();
+    assert.equal(g.rules[0].pattern, '/sell/');
+  });
+
+  it('setPolicy rejects an invalid regex, dup pattern, and >50 rules', async function () {
+    await assert.rejects(
+      () => redisCache.setPolicy({ rules: [{ pattern: '(', ttlHours: 1 }] }),
+      /invalid regex/,
+    );
+    await assert.rejects(
+      () =>
+        redisCache.setPolicy({
+          rules: [
+            { pattern: '/x/', ttlHours: 1 },
+            { pattern: '/x/', ttlHours: 2 },
+          ],
+        }),
+      /duplicate/,
+    );
+    const many = [];
+    for (let i = 0; i < 51; i += 1)
+      many.push({ pattern: '/p' + i + '/', ttlHours: 1 });
+    await assert.rejects(
+      () => redisCache.setPolicy({ rules: many }),
+      /too many rules/,
+    );
+  });
+
+  it('setPolicy rejects two rules that match a cached URL with different settings', async function () {
+    client._z.set('https://x/sell/btc', Date.now());
+    await assert.rejects(
+      () =>
+        redisCache.setPolicy({
+          rules: [
+            { pattern: '/sell/', ttlHours: 2, onExpiry: 'drop', cache: true },
+            { pattern: 'btc', ttlHours: 5, onExpiry: 'refresh', cache: true },
+          ],
+        }),
+      /conflicts with/,
+    );
+  });
+
+  it('setPolicy allows overlapping rules with identical settings', async function () {
+    client._z.set('https://x/sell/btc', Date.now());
+    const r = await redisCache.setPolicy({
+      rules: [
+        { pattern: '/sell/', ttlHours: 2, onExpiry: 'drop', cache: true },
+        { pattern: 'btc', ttlHours: 2, onExpiry: 'drop', cache: true },
+      ],
+    });
+    assert.equal(r.rules.length, 2);
+  });
+
+  it('a no-cache URL rule overrides the class (beforeSend skips the write)', async function () {
+    redisCache._setRulesForTests([{ pattern: '/admin/', cache: false }]);
+    const req = makeReq({
+      prerender: {
+        _cacheLockOwner: true,
+        url: 'https://x/admin/panel',
+        statusCode: 200,
+        content: '<html>a</html>',
+      },
+    });
+    await redisCache.beforeSend(req, res, next);
+    const htmlKeys = [...client._kv.keys()].filter((k) =>
+      k.startsWith('prerender:v1:html:'),
+    );
+    assert.equal(htmlKeys.length, 0);
+  });
+
+  it('a drop URL rule overrides a 2xx (status evicts past the rule TTL)', async function () {
+    redisCache._setRulesForTests([
+      { pattern: '/tmp/', cache: true, ttlHours: 0.001, onExpiry: 'drop' },
+    ]);
+    const url = 'https://x/tmp/p';
+    client._kv.set('prerender:v1:html:' + url, 'x');
+    client._z.set(url, Date.now() - 60 * 1000);
+    await client.hset('prerender:v1:status', url, 200);
+    const rows = await redisCache.status([url]);
+    assert.equal(rows[0].cached, false);
+    assert.equal(client._z.has(url), false);
+  });
+
+  it('dueForRefresh uses a rule refresh interval and skips drop rules', async function () {
+    const HOUR = 3600000;
+    redisCache._setRulesForTests([
+      { pattern: '/r/', cache: true, ttlHours: 1, onExpiry: 'refresh' },
+      { pattern: '/d/', cache: true, ttlHours: 1, onExpiry: 'drop' },
+    ]);
+    const now = Date.now();
+    client._z.set('https://x/r/a', now - 2 * HOUR);
+    client._z.set('https://x/d/a', now - 2 * HOUR);
+    await client.hset('prerender:v1:status', 'https://x/r/a', 200);
+    await client.hset('prerender:v1:status', 'https://x/d/a', 200);
+    const due = await redisCache.dueForRefresh({ limit: 10, now });
+    assert.deepEqual(due, ['https://x/r/a']);
+  });
+
+  it('previewPattern returns total/matched/sample and rejects a bad regex', async function () {
+    client._z.set('https://x/sell/a', 100);
+    client._z.set('https://x/sell/b', 200);
+    client._z.set('https://x/buy/c', 300);
+    const p = await redisCache.previewPattern({ pattern: '/sell/' });
+    assert.equal(p.total, 3);
+    assert.equal(p.matched, 2);
+    assert.equal(p.sample.length, 2);
+    assert.equal(p.sample[0].url, 'https://x/sell/b'); // newest first
+    assert.deepEqual(p.conflictsWith, []);
+    await assert.rejects(
+      () => redisCache.previewPattern({ pattern: '(' }),
+      /invalid regex/,
+    );
+  });
+
+  it('getPolicy reads the legacy bare-class policy shape (back-compat)', async function () {
+    client._kv.set(
+      'prerender:v1:policy',
+      JSON.stringify({ '4xx': { cache: false } }),
+    );
+    const g = await redisCache.getPolicy();
+    assert.equal(g.policy['4xx'].cache, false);
+    assert.equal(g.policy['4xx'].custom, true);
+    assert.deepEqual(g.rules, []);
   });
 
   it('flush({cache:true}) invalidates the list memo so the next list() rescans', async function () {
