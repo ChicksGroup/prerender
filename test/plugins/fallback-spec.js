@@ -33,15 +33,30 @@ describe('fallback plugin', function () {
     fallback._reset();
   });
 
-  it('records a fallback failure with the reason when the SaaS fetch fails', async function () {
+  it('records a FAILED fallback event with the reason when the SaaS fetch fails', async function () {
     fallback._setFetchForTests(() => Promise.resolve({ error: true, reason: 'saas_5xx' }));
-    const rec = sandbox.stub(redisCache, 'recordFallbackFailure');
+    const rec = sandbox.stub(redisCache, 'recordFallbackEvent');
     const req = makeReq({ prerender: { statusCode: 502, url: 'https://x/p' } });
     await new Promise((resolve) => fallback.beforeSend(req, res, resolve));
     assert(rec.calledOnce);
+    assert.equal(rec.firstCall.args[0].outcome, 'failed');
     assert.equal(rec.firstCall.args[0].reason, 'saas_5xx');
     assert.equal(rec.firstCall.args[0].trigger, 502);
     assert.equal(rec.firstCall.args[0].url, 'https://x/p');
+  });
+
+  it('records a SERVED fallback event (with the SaaS status) when the fallback succeeds', async function () {
+    fallback._setFetchForTests(() =>
+      Promise.resolve({ statusCode: 200, headers: {}, content: '<html>saas</html>' }),
+    );
+    const rec = sandbox.stub(redisCache, 'recordFallbackEvent');
+    const req = makeReq({ prerender: { statusCode: 504, url: 'https://x/ok' } });
+    await new Promise((resolve) => fallback.beforeSend(req, res, resolve));
+    assert(rec.calledOnce);
+    assert.equal(rec.firstCall.args[0].outcome, 'served');
+    assert.equal(rec.firstCall.args[0].status, 200);
+    assert.equal(rec.firstCall.args[0].trigger, 504);
+    assert.equal(req.prerender._fromFallback, true);
   });
 
   it('enabled() requires both the flag and a token', function () {
