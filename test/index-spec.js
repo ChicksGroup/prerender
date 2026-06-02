@@ -34,10 +34,7 @@ describe('Prerender', function () {
         'http://www.example.com/?_escaped_fragment_=/user/1&param1=yes&param2=no',
       );
 
-      assert.equal(
-        url,
-        'http://www.example.com/?param1=yes&param2=no#!/user/1',
-      );
+      assert.equal(url, 'http://www.example.com/#!/user/1');
     });
 
     it('should return the correct URL for #! URLs if query string is before hash', function () {
@@ -45,10 +42,7 @@ describe('Prerender', function () {
         'http://www.example.com/?param1=yes&param2=no&_escaped_fragment_=/user/1',
       );
 
-      assert.equal(
-        url,
-        'http://www.example.com/?param1=yes&param2=no#!/user/1',
-      );
+      assert.equal(url, 'http://www.example.com/#!/user/1');
     });
 
     it('should return the correct URL for #! URLs that are encoded with another ?', function () {
@@ -56,10 +50,7 @@ describe('Prerender', function () {
         'http://www.example.com/?_escaped_fragment_=%2Fuser%2F1%3Fparam1%3Dyes%26param2%3Dno',
       );
 
-      assert.equal(
-        url,
-        'http://www.example.com/?param1=yes&param2=no#!/user/1',
-      );
+      assert.equal(url, 'http://www.example.com/#!/user/1');
     });
 
     it('should return the correct URL for html5 push state URLs', function () {
@@ -70,12 +61,27 @@ describe('Prerender', function () {
       assert.equal(url, 'http://www.example.com/user/1');
     });
 
-    it('should return the correct URL for html5 push state URLs with query strings', function () {
+    it('should strip query strings from html5 push state URLs', function () {
       var url = util.getUrl(
         'http://www.example.com/user/1?param1=yes&param2=no&_escaped_fragment_=',
       );
 
-      assert.equal(url, 'http://www.example.com/user/1?param1=yes&param2=no');
+      assert.equal(url, 'http://www.example.com/user/1');
+    });
+
+    it('should ignore all query params so they map to a single page', function () {
+      assert.equal(
+        util.getUrl('http://www.example.com/page?foo=bar'),
+        'http://www.example.com/page',
+      );
+      assert.equal(
+        util.getUrl('http://www.example.com/page?foo=bar&baz=qux'),
+        'http://www.example.com/page',
+      );
+      assert.equal(
+        util.getUrl('http://www.example.com/page'),
+        'http://www.example.com/page',
+      );
     });
 
     it('should fix incorrect html5 URL that Bing accesses', function () {
