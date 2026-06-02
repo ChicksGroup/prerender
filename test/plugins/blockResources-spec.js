@@ -180,5 +180,36 @@ describe('blockResources plugin', function () {
       });
       assert.deepStrictEqual(state.continued[1], { interceptionId: '2' });
     });
+
+    it('swallows a rejected continueInterceptedRequest (tab closing mid-render)', function (done) {
+      // Real CDP returns a promise that rejects when the tab's WebSocket is
+      // already closing. The handler must not let that become an unhandled
+      // rejection (which would crash the process under --unhandled-rejections=throw).
+      const tab = {
+        Network: {
+          setRequestInterception: () => Promise.resolve(),
+          requestIntercepted: (cb) => {
+            cb({
+              interceptionId: '1',
+              request: { url: 'https://chicksx.com/app.bundle.js' },
+              resourceType: 'Script',
+            });
+          },
+          continueInterceptedRequest: () =>
+            Promise.reject(new Error('WebSocket is not open: readyState 2 (CLOSING)')),
+        },
+      };
+
+      const onUnhandled = (err) => done(err || new Error('unhandled rejection'));
+      process.once('unhandledRejection', onUnhandled);
+      assert.doesNotThrow(() =>
+        blockResources.tabCreated({ prerender: { tab } }, {}, () => {}),
+      );
+      // Give a rejected promise a tick to surface as unhandled, if it would.
+      setImmediate(() => {
+        process.removeListener('unhandledRejection', onUnhandled);
+        done();
+      });
+    });
   });
 });
