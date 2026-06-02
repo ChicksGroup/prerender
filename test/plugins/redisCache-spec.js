@@ -830,6 +830,57 @@ describe('redisCache introspection & guards', function () {
     assert.equal(spy.callCount, 1); // memo dropped -> fresh index scan
   });
 
+  it('removeMatching() bulk-deletes entries of a status class (kept others)', async function () {
+    const now = Date.now();
+    client._z.set('https://x/ok', now);
+    client._z.set('https://x/r1', now);
+    client._z.set('https://x/r2', now);
+    await client.hset('prerender:v1:status', 'https://x/ok', 200);
+    await client.hset('prerender:v1:status', 'https://x/r1', 301);
+    await client.hset('prerender:v1:status', 'https://x/r2', 302);
+    const out = await redisCache.removeMatching({ status: '3xx' });
+    assert.deepEqual(out, { matched: 2, started: true });
+    await new Promise((r) => setTimeout(r, 20)); // drain background eviction
+    assert.equal(client._z.has('https://x/ok'), true); // 2xx kept
+    assert.equal(client._z.has('https://x/r1'), false); // 3xx gone
+    assert.equal(client._z.has('https://x/r2'), false);
+  });
+
+  it('removeMatching() bulk-deletes a domain', async function () {
+    const now = Date.now();
+    client._z.set('https://www.chicksx.com/a', now);
+    client._z.set('https://www.chicksgold.com/b', now);
+    const out = await redisCache.removeMatching({ domain: 'www.chicksx.com' });
+    assert.equal(out.matched, 1);
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(client._z.has('https://www.chicksx.com/a'), false);
+    assert.equal(client._z.has('https://www.chicksgold.com/b'), true);
+  });
+
+  it('removeMatching() bulk-deletes a search term', async function () {
+    client._z.set('https://x/sell/bitcoin', 100);
+    client._z.set('https://x/buy/bitcoin', 200);
+    const out = await redisCache.removeMatching({ q: 'sell' });
+    assert.equal(out.matched, 1);
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(client._z.has('https://x/sell/bitcoin'), false);
+    assert.equal(client._z.has('https://x/buy/bitcoin'), true);
+  });
+
+  it('removeMatching() rejects with NO_FILTER when no filter is set', async function () {
+    client._z.set('https://x/a', 100);
+    await assert.rejects(
+      () => redisCache.removeMatching({ q: '', status: '', domain: '' }),
+      (e) => e.code === 'NO_FILTER',
+    );
+    assert.equal(client._z.has('https://x/a'), true); // nothing removed
+  });
+
+  it('removeMatching() rejects when cache disabled', async function () {
+    redisCache._setEnabledForTests(false);
+    await assert.rejects(() => redisCache.removeMatching({ status: '2xx' }));
+  });
+
   it('remove() rejects when cache disabled', async function () {
     redisCache._setEnabledForTests(false);
     await assert.rejects(() => redisCache.remove(['https://x/']));
@@ -880,6 +931,33 @@ describe('redisCache introspection & guards', function () {
     assert.equal(cg.buckets['<1h'], 1);
     assert.equal(cg.buckets['1-24h'], 1);
     assert.equal(typeof s.computedAt, 'number');
+  });
+
+  it('statsByDomain() breaks the cache down by status code (global + per-domain)', async function () {
+    const now = Date.now();
+    client._z.set('https://www.chicksx.com/a', now);
+    client._z.set('https://www.chicksx.com/b', now);
+    client._z.set('https://www.chicksx.com/r', now);
+    client._z.set('https://www.chicksgold.com/missing', now);
+    await client.hset('prerender:v1:status', 'https://www.chicksx.com/a', 200);
+    await client.hset('prerender:v1:status', 'https://www.chicksx.com/b', 200);
+    await client.hset('prerender:v1:status', 'https://www.chicksx.com/r', 301);
+    await client.hset(
+      'prerender:v1:status',
+      'https://www.chicksgold.com/missing',
+      404,
+    );
+    const s = await redisCache.statsByDomain();
+    assert.deepEqual(s.global.statusCounts, { 200: 2, 301: 1, 404: 1 });
+    const cx = s.domains.find((d) => d.domain === 'www.chicksx.com');
+    assert.deepEqual(cx.statusCounts, { 200: 2, 301: 1 });
+  });
+
+  it('statsByDomain() omits entries with no recorded status from statusCounts', async function () {
+    client._z.set('https://www.chicksx.com/nostatus', Date.now());
+    const s = await redisCache.statsByDomain();
+    assert.equal(s.global.count, 1);
+    assert.deepEqual(s.global.statusCounts, {});
   });
 
   it('statsByDomain() memoizes within TTL (single ZRANGE)', async function () {
