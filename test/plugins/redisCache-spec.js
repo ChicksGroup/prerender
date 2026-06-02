@@ -1104,6 +1104,125 @@ describe('redisCache introspection & guards', function () {
     assert.equal(g.policy['4xx'].cache, false);
     assert.equal(g.policy['4xx'].custom, true);
     assert.deepEqual(g.rules, []);
+    assert.deepEqual(g.noRenderRules, []);
+  });
+
+  it('setPolicy persists noRenderRules and getPolicy returns them', async function () {
+    const r = await redisCache.setPolicy({
+      noRenderRules: [{ pattern: '/admin/', statusCode: 410 }],
+    });
+    assert.equal(r.noRenderRules.length, 1);
+    assert.equal(r.noRenderRules[0].pattern, '/admin/');
+    assert.equal(r.noRenderRules[0].statusCode, 410);
+    assert.ok(r.noRenderRules[0].id);
+    const stored = JSON.parse(client._kv.get('prerender:v1:policy'));
+    assert.equal(stored.noRenderRules.length, 1);
+    assert.equal(stored.noRenderRules[0].statusCode, 410);
+    const g = await redisCache.getPolicy();
+    assert.equal(g.noRenderRules[0].pattern, '/admin/');
+  });
+
+  it('setPolicy rejects a bad no-render regex, dup, >50, and a disallowed statusCode', async function () {
+    await assert.rejects(
+      () =>
+        redisCache.setPolicy({
+          noRenderRules: [{ pattern: '(', statusCode: 410 }],
+        }),
+      /invalid no-render regex/,
+    );
+    await assert.rejects(
+      () =>
+        redisCache.setPolicy({
+          noRenderRules: [
+            { pattern: '/x/', statusCode: 410 },
+            { pattern: '/x/', statusCode: 404 },
+          ],
+        }),
+      /duplicate no-render/,
+    );
+    const many = [];
+    for (let i = 0; i < 51; i += 1)
+      many.push({ pattern: '/p' + i + '/', statusCode: 410 });
+    await assert.rejects(
+      () => redisCache.setPolicy({ noRenderRules: many }),
+      /too many no-render rules/,
+    );
+    await assert.rejects(
+      () =>
+        redisCache.setPolicy({
+          noRenderRules: [{ pattern: '/x/', statusCode: 500 }],
+        }),
+      /statusCode/,
+    );
+    await assert.rejects(
+      () => redisCache.setPolicy({ noRenderRules: [{ pattern: '/x/' }] }),
+      /statusCode/,
+    );
+  });
+
+  it('a no-render rule short-circuits requestReceived with the status + empty body', async function () {
+    redisCache._setNoRenderRulesForTests([
+      { pattern: '/admin/', statusCode: 410 },
+    ]);
+    const req = makeReq({ prerender: { url: 'https://x/admin/panel' } });
+    await redisCache.requestReceived(req, res, next);
+    assert(res.send.calledOnce);
+    assert.equal(res.send.firstCall.args[0], 410);
+    assert.equal(res.send.firstCall.args[1], '');
+    assert(next.notCalled); // never proceeds to render
+    assert.equal(req.prerender._noRender, true);
+  });
+
+  it('a no-render rule wins over a cache hit (cached body is never served)', async function () {
+    const url = 'https://x/admin/panel';
+    client._kv.set('prerender:v1:html:' + url, entryJson({ body: '<html>cached</html>' }));
+    client._z.set(url, Date.now());
+    redisCache._setNoRenderRulesForTests([
+      { pattern: '/admin/', statusCode: 404 },
+    ]);
+    const req = makeReq({ prerender: { url } });
+    await redisCache.requestReceived(req, res, next);
+    assert.equal(res.send.firstCall.args[0], 404);
+    assert.equal(res.send.firstCall.args[1], ''); // not the cached HTML
+  });
+
+  it('beforeSend writes nothing for a no-render short-circuit (even with single-flight off)', async function () {
+    // Single-flight off + cacheable 200 + no min-bytes gate => shouldWrite would be
+    // true, so this locks in the `if (p._noRender) return next();` guard as the only
+    // thing preventing the write.
+    redisCache._setConfigForTests({ singleFlight: false, minHtmlBytes: 0 });
+    redisCache._setEnabledForTests(true);
+    redisCache._setClientForTests(client);
+    redisCache._setNoRenderRulesForTests([
+      { pattern: '/admin/', statusCode: 410 },
+    ]);
+    const req = makeReq({
+      prerender: {
+        _noRender: true,
+        url: 'https://x/admin/p',
+        statusCode: 200,
+        content: '<html><head></head><body>hi</body></html>',
+      },
+    });
+    await redisCache.beforeSend(req, res, next);
+    assert(next.calledOnce);
+    const htmlKeys = [...client._kv.keys()].filter((k) =>
+      k.startsWith('prerender:v1:html:'),
+    );
+    assert.equal(htmlKeys.length, 0);
+  });
+
+  it('removeMatching({pattern}) bulk-deletes only URLs the regex matches', async function () {
+    const now = Date.now();
+    client._z.set('https://x/admin/a', now);
+    client._z.set('https://x/admin/b', now);
+    client._z.set('https://x/ok', now);
+    const out = await redisCache.removeMatching({ pattern: '/admin/' });
+    assert.equal(out.matched, 2);
+    await new Promise((r) => setTimeout(r, 20)); // drain background eviction
+    assert.equal(client._z.has('https://x/admin/a'), false);
+    assert.equal(client._z.has('https://x/admin/b'), false);
+    assert.equal(client._z.has('https://x/ok'), true); // non-match kept
   });
 
   it('flush({cache:true}) invalidates the list memo so the next list() rescans', async function () {
