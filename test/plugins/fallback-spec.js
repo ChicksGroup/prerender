@@ -1,5 +1,6 @@
 const assert = require('assert');
 const sinon = require('sinon');
+const http = require('http');
 const fallback = require('../../lib/plugins/fallback');
 const redisCache = require('../../lib/plugins/redisCache');
 
@@ -57,6 +58,49 @@ describe('fallback plugin', function () {
     assert.equal(rec.firstCall.args[0].status, 200);
     assert.equal(rec.firstCall.args[0].trigger, 504);
     assert.equal(req.prerender._fromFallback, true);
+  });
+
+  it('serves a SaaS redirect (3xx + Location, empty body) and records it served with the status', async function () {
+    fallback._setFetchForTests(() =>
+      Promise.resolve({ statusCode: 301, headers: { location: 'https://x/new' }, content: '', redirect: true }),
+    );
+    const rec = sandbox.stub(redisCache, 'recordFallbackEvent');
+    const req = makeReq({ prerender: { statusCode: 504, url: 'https://x/old' } });
+    await new Promise((resolve) => fallback.beforeSend(req, res, resolve));
+    assert(rec.calledOnce);
+    assert.equal(rec.firstCall.args[0].outcome, 'served');
+    assert.equal(rec.firstCall.args[0].status, 301);
+    assert.equal(req.prerender.statusCode, 301);
+    assert.equal(req.prerender.headers.location, 'https://x/new');
+    assert.equal(req.prerender._fromFallback, true);
+  });
+
+  it('realFetch returns a 3xx redirect (Location) as servable, not an empty failure', async function () {
+    const srv = http.createServer((rq, rs) => {
+      rs.writeHead(301, { Location: 'https://x/new' });
+      rs.end();
+    });
+    await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+    fallback._setConfigForTests({ enabled: true, token: 't', baseUrl: 'http://127.0.0.1:' + srv.address().port });
+    const result = await fallback.fetchFallback('https://x/old'); // realFetch (not stubbed)
+    srv.close();
+    assert.ok(!result.error, 'a redirect must not be an error');
+    assert.equal(result.statusCode, 301);
+    assert.equal(result.redirect, true);
+    assert.equal(result.headers.location, 'https://x/new');
+  });
+
+  it('realFetch still reports a content-less NON-redirect as an empty failure', async function () {
+    const srv = http.createServer((rq, rs) => {
+      rs.writeHead(200);
+      rs.end();
+    });
+    await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+    fallback._setConfigForTests({ enabled: true, token: 't', baseUrl: 'http://127.0.0.1:' + srv.address().port });
+    const result = await fallback.fetchFallback('https://x/empty');
+    srv.close();
+    assert.equal(result.error, true);
+    assert.equal(result.reason, 'empty');
   });
 
   it('enabled() requires both the flag and a token', function () {
