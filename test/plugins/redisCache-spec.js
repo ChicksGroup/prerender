@@ -1408,6 +1408,24 @@ describe('redisCache introspection & guards', function () {
     assert.equal(client._z.size, 1); // indexed for refresh
   });
 
+  it('caches an empty-body 3xx redirect that carries a Location (self-heal)', async function () {
+    const req = makeReq({
+      prerender: {
+        _cacheLockOwner: true,
+        url: 'https://x/redir',
+        statusCode: 301,
+        content: '', // a redirect legitimately has no body
+        headers: { location: 'https://x/new' },
+      },
+    });
+    await redisCache.beforeSend(req, res, next);
+    const htmlKeys = [...client._kv.keys()].filter((k) =>
+      k.startsWith('prerender:v1:html:'),
+    );
+    assert.equal(htmlKeys.length, 1); // stored despite the empty body
+    assert.equal(client._z.size, 1); // indexed
+  });
+
   it('statsByDomain() returns { enabled:false } when disabled', async function () {
     redisCache._setEnabledForTests(false);
     const s = await redisCache.statsByDomain();
