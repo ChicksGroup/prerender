@@ -173,3 +173,41 @@ describe('server.serveFromFallback (capacity path)', function () {
     assert(res.sendStatus.calledWith(429));
   });
 });
+
+describe('server._shedAtCapacity (render-path cap)', function () {
+  const server = require('../../lib/server');
+  const redisCache = require('../../lib/plugins/redisCache');
+  let sandbox, res;
+
+  beforeEach(function () {
+    sandbox = sinon.createSandbox();
+    res = { setHeader: sandbox.spy(), sendStatus: sandbox.spy() };
+    server.options = server.options || {};
+    server.options.overloadRetryAfter = '2';
+    fallback._reset();
+  });
+
+  afterEach(function () {
+    sandbox.restore();
+    fallback._reset();
+  });
+
+  it('offloads to the SaaS fallback when enabled (never 429s) and rejects to skip the render', async function () {
+    fallback._setConfigForTests({ enabled: true, token: 't' });
+    const ff = sandbox.stub(server, 'serveFromFallback').resolves();
+    const req = { prerender: { url: 'https://x/', renderType: 'html' } };
+    await assert.rejects(() => server._shedAtCapacity(req, res));
+    assert(ff.calledOnceWithExactly(req, res, 429));
+    assert(res.sendStatus.notCalled); // offloaded externally, not shed with 429
+  });
+
+  it('sheds 429 + Retry-After and releases the single-flight lock when no fallback', async function () {
+    fallback._setConfigForTests({ enabled: false, token: '' });
+    const rel = sandbox.stub(redisCache, 'releaseLockForRequest').resolves();
+    const req = { prerender: { url: 'https://x/', renderId: 'r1', _cacheLockOwner: true } };
+    await assert.rejects(() => server._shedAtCapacity(req, res));
+    assert(rel.calledOnceWith(req)); // lock released before the 429
+    assert(res.setHeader.calledWith('Retry-After', '2'));
+    assert(res.sendStatus.calledWith(429));
+  });
+});

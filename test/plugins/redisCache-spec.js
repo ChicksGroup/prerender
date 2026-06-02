@@ -1290,6 +1290,42 @@ describe('redisCache introspection & guards', function () {
     await assert.rejects(() => redisCache.remove(['https://x/']));
   });
 
+  it('releaseLockForRequest releases the lock for the owner under single-flight', async function () {
+    redisCache._setConfigForTests({ singleFlight: true });
+    redisCache._setEnabledForTests(true);
+    redisCache._setClientForTests(client);
+    const evalSpy = sandbox.spy(client, 'eval');
+    const req = {
+      prerender: { _cacheLockOwner: true, renderId: 'rid-9', url: 'https://x/p' },
+    };
+    await redisCache.releaseLockForRequest(req);
+    assert(evalSpy.calledOnce);
+    assert.equal(evalSpy.firstCall.args[3], 'rid-9'); // compare-and-del on our renderId
+    assert(String(evalSpy.firstCall.args[2]).indexOf(':lock:') > -1);
+  });
+
+  it('releaseLockForRequest is a no-op when this request is not the lock owner', async function () {
+    redisCache._setConfigForTests({ singleFlight: true });
+    redisCache._setEnabledForTests(true);
+    redisCache._setClientForTests(client);
+    const evalSpy = sandbox.spy(client, 'eval');
+    await redisCache.releaseLockForRequest({
+      prerender: { _cacheLockOwner: false, url: 'https://x/p' },
+    });
+    assert(evalSpy.notCalled);
+  });
+
+  it('releaseLockForRequest is a no-op when single-flight is off', async function () {
+    redisCache._setConfigForTests({ singleFlight: false });
+    redisCache._setEnabledForTests(true);
+    redisCache._setClientForTests(client);
+    const evalSpy = sandbox.spy(client, 'eval');
+    await redisCache.releaseLockForRequest({
+      prerender: { _cacheLockOwner: true, renderId: 'r', url: 'https://x/p' },
+    });
+    assert(evalSpy.notCalled);
+  });
+
   it('status() rejects when cache disabled', async function () {
     redisCache._setEnabledForTests(false);
     await assert.rejects(() => redisCache.status(['https://x/']));
