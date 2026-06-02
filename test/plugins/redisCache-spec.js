@@ -401,12 +401,30 @@ describe('redisCache introspection & guards', function () {
     const kv = new Map();
     const z = new Map(); // member -> score
     const h = new Map(); // hashKey -> Map(field -> number)
+    const l = new Map(); // listKey -> array (index 0 = head, LPUSH prepends)
     const sortedAsc = () => [...z.entries()].sort((a, b) => a[1] - b[1]);
     const withScores = (pairs) => pairs.flatMap(([m, s]) => [m, String(s)]);
     return {
       _kv: kv,
       _z: z,
       _h: h,
+      _l: l,
+      lpush: (key, val) => {
+        if (!l.has(key)) l.set(key, []);
+        l.get(key).unshift(val);
+        return Promise.resolve(l.get(key).length);
+      },
+      lrange: (key, start, stop) => {
+        const a = l.get(key) || [];
+        return Promise.resolve(a.slice(start, stop === -1 ? a.length : stop + 1));
+      },
+      ltrim: (key, start, stop) => {
+        if (l.has(key)) {
+          const a = l.get(key);
+          l.set(key, a.slice(start, stop === -1 ? a.length : stop + 1));
+        }
+        return Promise.resolve('OK');
+      },
       hincrby: (key, field, n) => {
         if (!h.has(key)) h.set(key, new Map());
         const m = h.get(key);
@@ -1324,6 +1342,39 @@ describe('redisCache introspection & guards', function () {
       prerender: { _cacheLockOwner: true, renderId: 'r', url: 'https://x/p' },
     });
     assert(evalSpy.notCalled);
+  });
+
+  it('recordFallbackFailure pushes an event; fallbackFailures returns them newest-first', async function () {
+    await redisCache.recordFallbackFailure({ url: 'https://x/a', trigger: 429, reason: 'saas_429' });
+    await redisCache.recordFallbackFailure({ url: 'https://x/b', trigger: 504, reason: 'timeout' });
+    const r = await redisCache.fallbackFailures({ limit: 10 });
+    assert.equal(r.enabled, true);
+    assert.equal(r.events.length, 2);
+    assert.equal(r.events[0].url, 'https://x/b'); // LPUSH -> newest first
+    assert.equal(r.events[0].reason, 'timeout');
+    assert.equal(r.events[0].trigger, 504);
+    assert.equal(r.events[0].host, 'x');
+    assert.ok(r.events[0].id && r.events[0].at);
+  });
+
+  it('recordFallbackFailure caps the ring buffer at fallbackLogMax (oldest dropped)', async function () {
+    redisCache._setConfigForTests({ fallbackLogMax: 3 });
+    redisCache._setEnabledForTests(true);
+    redisCache._setClientForTests(client);
+    for (let i = 0; i < 5; i += 1) {
+      // eslint-disable-next-line no-await-in-loop
+      await redisCache.recordFallbackFailure({ url: 'https://x/' + i, trigger: 500, reason: 'saas_5xx' });
+    }
+    const r = await redisCache.fallbackFailures({ limit: 100 });
+    assert.equal(r.events.length, 3);
+    assert.equal(r.events[0].url, 'https://x/4'); // newest kept
+    assert.equal(r.events[2].url, 'https://x/2'); // 0 and 1 trimmed
+  });
+
+  it('fallbackFailures returns {enabled:false} when disabled', async function () {
+    redisCache._setEnabledForTests(false);
+    const r = await redisCache.fallbackFailures({ limit: 10 });
+    assert.equal(r.enabled, false);
   });
 
   it('status() rejects when cache disabled', async function () {

@@ -1,6 +1,7 @@
 const assert = require('assert');
 const sinon = require('sinon');
 const fallback = require('../../lib/plugins/fallback');
+const redisCache = require('../../lib/plugins/redisCache');
 
 function makeReq(over) {
   const p = Object.assign(
@@ -30,6 +31,17 @@ describe('fallback plugin', function () {
   afterEach(function () {
     sandbox.restore();
     fallback._reset();
+  });
+
+  it('records a fallback failure with the reason when the SaaS fetch fails', async function () {
+    fallback._setFetchForTests(() => Promise.resolve({ error: true, reason: 'saas_5xx' }));
+    const rec = sandbox.stub(redisCache, 'recordFallbackFailure');
+    const req = makeReq({ prerender: { statusCode: 502, url: 'https://x/p' } });
+    await new Promise((resolve) => fallback.beforeSend(req, res, resolve));
+    assert(rec.calledOnce);
+    assert.equal(rec.firstCall.args[0].reason, 'saas_5xx');
+    assert.equal(rec.firstCall.args[0].trigger, 502);
+    assert.equal(rec.firstCall.args[0].url, 'https://x/p');
   });
 
   it('enabled() requires both the flag and a token', function () {
