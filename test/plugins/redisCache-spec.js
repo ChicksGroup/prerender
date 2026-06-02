@@ -260,7 +260,10 @@ describe('redisCache plugin', function () {
     });
 
     it('applies the minHtmlBytes guard to 200 only (a small 404 still caches)', async function () {
-      redisCache._setConfigForTests({ minHtmlBytes: 20000, error4xxTtlMs: 1000 });
+      redisCache._setConfigForTests({
+        minHtmlBytes: 20000,
+        error4xxTtlMs: 1000,
+      });
       redisCache._setEnabledForTests(true);
       redisCache._setClientForTests(client);
       client.set.resolves('OK');
@@ -652,6 +655,186 @@ describe('redisCache introspection & guards', function () {
     assert.equal(s.newestStoredAt, 300);
   });
 
+  it('list() filters by case-insensitive URL substring (q)', async function () {
+    client._z.set('https://www.chicksgold.com/buy', 100);
+    client._z.set('https://www.chicksx.com/sell', 200);
+    const out = await redisCache.list({ q: 'CHICKSX' });
+    assert.equal(out.total, 1);
+    assert.equal(out.results[0].url, 'https://www.chicksx.com/sell');
+  });
+
+  it('list() filters by exact domain', async function () {
+    client._z.set('https://www.chicksgold.com/a', 100);
+    client._z.set('https://www.chicksx.com/b', 200);
+    const out = await redisCache.list({ domain: 'www.chicksx.com' });
+    assert.equal(out.total, 1);
+    assert.equal(out.results[0].domain, 'www.chicksx.com');
+  });
+
+  it('list() filters by status class and by exact code', async function () {
+    const now = Date.now();
+    client._z.set('https://s/ok', now);
+    client._z.set('https://s/redir', now);
+    client._z.set('https://s/missing', now);
+    await client.hset('prerender:v1:status', 'https://s/ok', 200);
+    await client.hset('prerender:v1:status', 'https://s/redir', 301);
+    await client.hset('prerender:v1:status', 'https://s/missing', 404);
+    const c4 = await redisCache.list({ status: '4xx' });
+    assert.deepEqual(
+      c4.results.map((r) => r.url),
+      ['https://s/missing'],
+    );
+    const c3 = await redisCache.list({ status: '3xx' });
+    assert.deepEqual(
+      c3.results.map((r) => r.url),
+      ['https://s/redir'],
+    );
+    const exact = await redisCache.list({ status: '200' });
+    assert.deepEqual(
+      exact.results.map((r) => r.url),
+      ['https://s/ok'],
+    );
+  });
+
+  it('list() sorts newest-first by default and paginates with a total', async function () {
+    client._z.set('https://p/1', 100);
+    client._z.set('https://p/2', 200);
+    client._z.set('https://p/3', 300);
+    client._z.set('https://p/4', 400);
+    client._z.set('https://p/5', 500);
+    const page = await redisCache.list({ limit: 2, offset: 0 });
+    assert.equal(page.total, 5);
+    assert.equal(page.limit, 2);
+    assert.deepEqual(
+      page.results.map((r) => r.storedAt),
+      [500, 400],
+    );
+    const page2 = await redisCache.list({ limit: 2, offset: 2 });
+    assert.deepEqual(
+      page2.results.map((r) => r.storedAt),
+      [300, 200],
+    );
+  });
+
+  it('list() sorts by url ascending when asked', async function () {
+    client._z.set('https://z/', 100);
+    client._z.set('https://a/', 200);
+    const out = await redisCache.list({ sort: 'url', dir: 'asc' });
+    assert.deepEqual(
+      out.results.map((r) => r.url),
+      ['https://a/', 'https://z/'],
+    );
+  });
+
+  it('list() clamps limit to 200', async function () {
+    client._z.set('https://a/', 100);
+    const out = await redisCache.list({ limit: 9999 });
+    assert.equal(out.limit, 200);
+  });
+
+  it('list() hides an expired 4xx', async function () {
+    redisCache._setConfigForTests({ error4xxTtlMs: 1000 });
+    redisCache._setEnabledForTests(true);
+    redisCache._setClientForTests(client);
+    const now = Date.now();
+    client._z.set('https://gone/', now - 5000); // older than the 1s TTL
+    client._z.set('https://ok/', now);
+    await client.hset('prerender:v1:status', 'https://gone/', 404);
+    await client.hset('prerender:v1:status', 'https://ok/', 200);
+    const out = await redisCache.list({});
+    assert.deepEqual(
+      out.results.map((r) => r.url),
+      ['https://ok/'],
+    );
+  });
+
+  it('list() reports null status when none recorded and excludes it from status filters', async function () {
+    client._z.set('https://nostatus/', 100);
+    const all = await redisCache.list({});
+    assert.equal(all.total, 1);
+    assert.equal(all.results[0].status, null);
+    const filtered = await redisCache.list({ status: '2xx' });
+    assert.equal(filtered.total, 0);
+  });
+
+  it('list() memoizes the snapshot (one index scan across calls)', async function () {
+    client._z.set('https://a/', 100);
+    const spy = sandbox.spy(client, 'zrange');
+    await redisCache.list({});
+    await redisCache.list({ q: 'a' });
+    assert.equal(spy.callCount, 1);
+  });
+
+  it('list() returns {enabled:false} when cache disabled', async function () {
+    redisCache._setEnabledForTests(false);
+    const out = await redisCache.list({});
+    assert.equal(out.enabled, false);
+  });
+
+  it('list() on an empty index returns total 0', async function () {
+    const out = await redisCache.list({});
+    assert.equal(out.enabled, true);
+    assert.equal(out.total, 0);
+    assert.deepEqual(out.results, []);
+  });
+
+  it('remove() normalizes the URL and evicts body + index + status', async function () {
+    const url = 'https://www.chicksx.com/p';
+    client._kv.set('prerender:v1:html:' + url, 'x');
+    client._z.set(url, Date.now());
+    await client.hset('prerender:v1:status', url, 200);
+    const out = await redisCache.remove(['/' + url]); // leading slash normalized away
+    assert.deepEqual(out, { removed: 1 });
+    assert.equal(client._z.has(url), false);
+    assert.equal(client._kv.has('prerender:v1:html:' + url), false);
+    assert.equal(client._h.get('prerender:v1:status').has(url), false);
+  });
+
+  it('remove() deletes multiple URLs and counts each', async function () {
+    client._z.set('https://a/', 100);
+    client._z.set('https://b/', 200);
+    const out = await redisCache.remove(['https://a/', 'https://b/']);
+    assert.equal(out.removed, 2);
+    assert.equal(client._z.has('https://a/'), false);
+    assert.equal(client._z.has('https://b/'), false);
+  });
+
+  it('remove() skips empty/malformed URLs without throwing', async function () {
+    const out = await redisCache.remove(['', null]);
+    assert.equal(out.removed, 0);
+  });
+
+  it('remove() invalidates the list + stats memos', async function () {
+    client._z.set('https://a/', 100);
+    client._z.set('https://b/', 200);
+    await redisCache.list({}); // prime list memo
+    await redisCache.statsByDomain(); // prime stats memo
+    await redisCache.remove(['https://a/']);
+    const spy = sandbox.spy(client, 'zrange');
+    const out = await redisCache.list({});
+    assert.equal(spy.callCount, 1); // memo invalidated -> fresh scan
+    assert.deepEqual(
+      out.results.map((r) => r.url),
+      ['https://b/'],
+    );
+    const stats = await redisCache.statsByDomain();
+    assert.equal(stats.global.count, 1);
+  });
+
+  it('flush({cache:true}) invalidates the list memo so the next list() rescans', async function () {
+    client._z.set('https://a/', 100);
+    await redisCache.list({}); // prime the list memo
+    await redisCache.flush({ cache: true });
+    const spy = sandbox.spy(client, 'zrange');
+    await redisCache.list({});
+    assert.equal(spy.callCount, 1); // memo dropped -> fresh index scan
+  });
+
+  it('remove() rejects when cache disabled', async function () {
+    redisCache._setEnabledForTests(false);
+    await assert.rejects(() => redisCache.remove(['https://x/']));
+  });
+
   it('status() rejects when cache disabled', async function () {
     redisCache._setEnabledForTests(false);
     await assert.rejects(() => redisCache.status(['https://x/']));
@@ -940,7 +1123,9 @@ describe('redisCache work queue', function () {
         return Promise.resolve(1);
       },
       zpopmin: (key, count) => {
-        const sorted = [...z.entries()].sort((x, y) => x[1] - y[1]).slice(0, count);
+        const sorted = [...z.entries()]
+          .sort((x, y) => x[1] - y[1])
+          .slice(0, count);
         const out = [];
         for (const [m, s] of sorted) {
           out.push(m, String(s));
@@ -975,12 +1160,18 @@ describe('redisCache work queue', function () {
   });
 
   it('enqueue adds new urls (NX dedups), dequeue pops by priority', async function () {
-    assert.equal(await redisCache.enqueue(['https://x/a', 'https://x/b'], 1), 2);
+    assert.equal(
+      await redisCache.enqueue(['https://x/a', 'https://x/b'], 1),
+      2,
+    );
     assert.equal(await redisCache.enqueue(['https://x/a'], 1), 0); // duplicate -> skipped
     assert.equal(await redisCache.enqueue(['https://x/c'], 0), 1); // higher priority
     assert.equal(await redisCache.queueDepth(), 3);
     assert.deepEqual(await redisCache.dequeue(1), ['https://x/c']); // P0 before P1
-    assert.deepEqual((await redisCache.dequeue(10)).sort(), ['https://x/a', 'https://x/b']);
+    assert.deepEqual((await redisCache.dequeue(10)).sort(), [
+      'https://x/a',
+      'https://x/b',
+    ]);
     assert.equal(await redisCache.queueDepth(), 0);
   });
 
@@ -1011,14 +1202,22 @@ describe('redisCache flush (admin reset)', function () {
 
   // SCAN returns a single page per pattern, then cursor '0'.
   const scanPages = {
-    'prerender:v1:html:*': ['prerender:v1:html:a', 'prerender:v1:html:b', 'prerender:v1:html:c'],
+    'prerender:v1:html:*': [
+      'prerender:v1:html:a',
+      'prerender:v1:html:b',
+      'prerender:v1:html:c',
+    ],
     'prerender:v1:lock:*': ['prerender:v1:lock:a'],
-    'prerender:v1:metrics:*': ['prerender:v1:metrics:ondemand', 'prerender:v1:metrics:scheduled'],
+    'prerender:v1:metrics:*': [
+      'prerender:v1:metrics:ondemand',
+      'prerender:v1:metrics:scheduled',
+    ],
   };
 
   function makeFlushRedis() {
     return {
-      scan: (cursor, _m, pattern) => Promise.resolve(['0', scanPages[pattern] || []]),
+      scan: (cursor, _m, pattern) =>
+        Promise.resolve(['0', scanPages[pattern] || []]),
       del: sandbox.stub().resolves(1),
       unlink: sandbox.stub().resolves(1),
     };
@@ -1082,6 +1281,9 @@ describe('redisCache flush (admin reset)', function () {
 
   it('throws when the cache is disabled', async function () {
     redisCache._setEnabledForTests(false);
-    await assert.rejects(() => redisCache.flush({ cache: true }), /cache disabled/);
+    await assert.rejects(
+      () => redisCache.flush({ cache: true }),
+      /cache disabled/,
+    );
   });
 });
