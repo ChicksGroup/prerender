@@ -210,6 +210,20 @@ describe('redisCache plugin', function () {
       assert.equal(args[2], undefined); // no PX -> never expires
     });
 
+    it('caches a 200 with a PX TTL when the policy action is drop', async function () {
+      redisCache._setPolicyForTests({
+        '2xx': { cache: true, ttlHours: 2, onExpiry: 'drop' },
+      });
+      client.set.resolves('OK');
+      const req = makeReq({ prerender: { _cacheLockOwner: true } });
+      await redisCache.beforeSend(req, res, next);
+      assert(client.set.calledOnce);
+      const args = client.set.firstCall.args;
+      assert.equal(args[0], HTML_KEY);
+      assert.equal(args[2], 'PX');
+      assert.equal(args[3], 2 * 3600000);
+    });
+
     it('caches a 4xx with a PX TTL and records its status', async function () {
       redisCache._setConfigForTests({ error4xxTtlMs: 1000 });
       redisCache._setEnabledForTests(true);
@@ -819,6 +833,137 @@ describe('redisCache introspection & guards', function () {
     );
     const stats = await redisCache.statsByDomain();
     assert.equal(stats.global.count, 1);
+  });
+
+  it('getPolicy() returns historical defaults when nothing is stored', async function () {
+    const p = await redisCache.getPolicy();
+    assert.equal(p.enabled, true);
+    assert.equal(p.policy['2xx'].ttlHours, 24);
+    assert.equal(p.policy['2xx'].onExpiry, 'refresh');
+    assert.equal(p.policy['2xx'].custom, false);
+    assert.equal(p.policy['3xx'].ttlHours, 168);
+    assert.equal(p.policy['3xx'].onExpiry, 'refresh');
+    assert.equal(p.policy['4xx'].ttlHours, 24);
+    assert.equal(p.policy['4xx'].onExpiry, 'drop');
+  });
+
+  it('setPolicy() validates, persists, and getPolicy() reflects it', async function () {
+    const r = await redisCache.setPolicy({
+      '2xx': { cache: true, ttlHours: 48, onExpiry: 'refresh' },
+      '3xx': { cache: true, ttlHours: 12, onExpiry: 'drop' },
+      '4xx': { cache: false },
+    });
+    assert.equal(r.policy['2xx'].ttlHours, 48);
+    assert.equal(r.policy['2xx'].custom, true);
+    assert.equal(r.policy['3xx'].onExpiry, 'drop');
+    assert.equal(r.policy['4xx'].cache, false);
+    assert.ok(client._kv.has('prerender:v1:policy'));
+    const stored = JSON.parse(client._kv.get('prerender:v1:policy'));
+    assert.equal(stored['4xx'].cache, false);
+    const g = await redisCache.getPolicy();
+    assert.equal(g.policy['2xx'].ttlHours, 48);
+    assert.equal(g.policy['4xx'].cache, false);
+  });
+
+  it('setPolicy() rejects non-positive or absurd TTLs', async function () {
+    await assert.rejects(
+      () => redisCache.setPolicy({ '2xx': { cache: true, ttlHours: 0 } }),
+      /positive/,
+    );
+    await assert.rejects(
+      () => redisCache.setPolicy({ '2xx': { cache: true, ttlHours: 999999 } }),
+      /too large/,
+    );
+  });
+
+  it('beforeSend skips a class the policy marks no-cache', async function () {
+    redisCache._setPolicyForTests({ '4xx': { cache: false } });
+    const req = makeReq({
+      prerender: {
+        _cacheLockOwner: true,
+        statusCode: 404,
+        content: '<html>nf</html>',
+      },
+    });
+    await redisCache.beforeSend(req, res, next);
+    const htmlKeys = [...client._kv.keys()].filter((k) =>
+      k.startsWith('prerender:v1:html:'),
+    );
+    assert.equal(htmlKeys.length, 0);
+  });
+
+  it('dueForRefresh honors a policy 2xx refresh interval', async function () {
+    const HOUR = 3600000;
+    redisCache._setPolicyForTests({
+      '2xx': { cache: true, ttlHours: 1, onExpiry: 'refresh' },
+    });
+    const now = Date.now();
+    client._z.set('https://x/a', now - 2 * HOUR);
+    client._z.set('https://x/b', now - 30 * 60 * 1000);
+    await client.hset('prerender:v1:status', 'https://x/a', 200);
+    await client.hset('prerender:v1:status', 'https://x/b', 200);
+    const due = await redisCache.dueForRefresh({ limit: 10, now });
+    assert.deepEqual(due, ['https://x/a']);
+  });
+
+  it('dueForRefresh refreshes a 4xx when the policy sets its action to refresh', async function () {
+    const HOUR = 3600000;
+    redisCache._setPolicyForTests({
+      '4xx': { cache: true, ttlHours: 1, onExpiry: 'refresh' },
+    });
+    const now = Date.now();
+    client._z.set('https://x/nf', now - 2 * HOUR);
+    await client.hset('prerender:v1:status', 'https://x/nf', 404);
+    const due = await redisCache.dueForRefresh({ limit: 10, now });
+    assert.deepEqual(due, ['https://x/nf']);
+  });
+
+  it('dueForRefresh skips a 2xx whose policy action is drop', async function () {
+    const HOUR = 3600000;
+    redisCache._setPolicyForTests({
+      '2xx': { cache: true, ttlHours: 1, onExpiry: 'drop' },
+    });
+    const now = Date.now();
+    client._z.set('https://x/a', now - 5 * HOUR);
+    await client.hset('prerender:v1:status', 'https://x/a', 200);
+    const due = await redisCache.dueForRefresh({ limit: 10, now });
+    assert.deepEqual(due, []);
+  });
+
+  it('status() evicts a 2xx the policy marks drop past its TTL', async function () {
+    redisCache._setPolicyForTests({
+      '2xx': { cache: true, ttlHours: 0.001, onExpiry: 'drop' },
+    });
+    const url = 'https://x/old';
+    client._kv.set('prerender:v1:html:' + url, 'x');
+    client._z.set(url, Date.now() - 60 * 1000);
+    await client.hset('prerender:v1:status', url, 200);
+    const rows = await redisCache.status([url]);
+    assert.equal(rows[0].cached, false);
+    assert.equal(client._z.has(url), false);
+  });
+
+  it('status() evicts a leftover entry whose class is now no-cache', async function () {
+    redisCache._setPolicyForTests({ '4xx': { cache: false } });
+    const url = 'https://x/nf';
+    client._kv.set('prerender:v1:html:' + url, 'x');
+    client._z.set(url, Date.now());
+    await client.hset('prerender:v1:status', url, 404);
+    const rows = await redisCache.status([url]);
+    assert.equal(rows[0].cached, false);
+    assert.equal(client._z.has(url), false);
+  });
+
+  it('status() keeps a 4xx the policy marks keep (never expires on read)', async function () {
+    redisCache._setPolicyForTests({
+      '4xx': { cache: true, ttlHours: 0.001, onExpiry: 'keep' },
+    });
+    const url = 'https://x/nf';
+    client._z.set(url, Date.now() - 60 * 1000);
+    await client.hset('prerender:v1:status', url, 404);
+    const rows = await redisCache.status([url]);
+    assert.equal(rows[0].cached, true);
+    assert.equal(rows[0].status, 404);
   });
 
   it('flush({cache:true}) invalidates the list memo so the next list() rescans', async function () {
