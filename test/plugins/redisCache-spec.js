@@ -438,7 +438,9 @@ describe('redisCache introspection & guards', function () {
         return Promise.resolve(o);
       },
       exists: (k) => Promise.resolve(kv.has(k) ? 1 : 0),
-      set: (k, v) => {
+      set: (k, v, ...args) => {
+        // emulate NX (the seeder scan lock): no-op when the key already exists
+        if (args.indexOf('NX') > -1 && kv.has(k)) return Promise.resolve(null);
         kv.set(k, v);
         return Promise.resolve('OK');
       },
@@ -477,13 +479,19 @@ describe('redisCache introspection & guards', function () {
       },
       hset: (key, field, val) => {
         if (!h.has(key)) h.set(key, new Map());
-        h.get(key).set(field, Number(val));
+        // store raw — JSON docs (sitemap scan statuses) must survive; numeric
+        // callers stringify identically on the way out (hgetall/hmget)
+        h.get(key).set(field, val);
         return Promise.resolve(1);
       },
-      hdel: (key, field) => {
+      hget: (key, field) => {
+        const m = h.get(key) || new Map();
+        return Promise.resolve(m.has(field) ? String(m.get(field)) : null);
+      },
+      hdel: (key, ...fields) => {
         const m = h.get(key);
-        if (m) m.delete(field);
-        return Promise.resolve(1);
+        if (m) fields.forEach((f) => m.delete(f));
+        return Promise.resolve(fields.length);
       },
       hmget: (key, ...fields) => {
         const m = h.get(key) || new Map();
@@ -496,7 +504,20 @@ describe('redisCache introspection & guards', function () {
         const keys = [...h.keys()].filter((k) => k.startsWith(pfx));
         return Promise.resolve(['0', keys]);
       },
-      eval: () => Promise.resolve(1),
+      // emulate the two lock Luas: compare-and-del (release) / compare-and-pexpire
+      // (renew) — both gate on the caller still owning the key
+      eval: (script, _nkeys, key, ...argv) => {
+        if (/pexpire/.test(script))
+          return Promise.resolve(kv.get(key) === argv[0] ? 1 : 0);
+        if (/del/.test(script)) {
+          if (kv.get(key) === argv[0]) {
+            kv.delete(key);
+            return Promise.resolve(1);
+          }
+          return Promise.resolve(0);
+        }
+        return Promise.resolve(1);
+      },
     };
   }
 
@@ -1556,6 +1577,219 @@ describe('redisCache introspection & guards', function () {
     redisCache._setEnabledForTests(false);
     const m = await redisCache.metricsAllLabels();
     assert.equal(m.enabled, false);
+  });
+
+  describe('sitemap config (admin-managed list + seeder support)', function () {
+    const SM_KEY = 'prerender:v1:sitemaps';
+    const STATUS_KEY = 'prerender:v1:sitemaps:status';
+    const LASTSCAN_KEY = 'prerender:v1:sitemaps:lastscan';
+    const entry = (id, url, enabled) => ({
+      id,
+      url,
+      enabled: enabled !== false,
+    });
+
+    it('getSitemaps() defaults to an empty list with the scan interval', async function () {
+      const g = await redisCache.getSitemaps();
+      assert.equal(g.enabled, true);
+      assert.deepEqual(g.sitemaps, []);
+      assert.equal(g.scan.intervalMs, 600000); // SEEDER_INTERVAL_MS default
+      assert.equal(g.scan.lastScanAt, null);
+    });
+
+    it('setSitemaps() persists the full document and returns the GET shape', async function () {
+      const r = await redisCache.setSitemaps({
+        sitemaps: [entry('a1', 'https://www.chicksx.com/sitemap_index.xml')],
+      });
+      assert.equal(r.enabled, true);
+      assert.equal(r.sitemaps.length, 1);
+      assert.equal(r.sitemaps[0].id, 'a1');
+      assert.equal(r.sitemaps[0].enabled, true);
+      assert.equal(r.sitemaps[0].status, null); // never scanned
+      const stored = JSON.parse(client._kv.get(SM_KEY));
+      assert.equal(stored.sitemaps[0].url, 'https://www.chicksx.com/sitemap_index.xml');
+      const g = await redisCache.getSitemaps();
+      assert.equal(g.sitemaps.length, 1);
+    });
+
+    it('setSitemaps() rejects malformed input with INVALID (-> 400)', async function () {
+      const cases = [
+        [{}, /must be an array/],
+        [{ sitemaps: 'x' }, /must be an array/],
+        [
+          {
+            sitemaps: Array.from({ length: 51 }, (_, i) =>
+              entry('id' + i, 'https://x.com/' + i),
+            ),
+          },
+          /too many sitemaps/,
+        ],
+        [{ sitemaps: [{ url: 'https://x.com/s.xml', enabled: true }] }, /needs an id/],
+        [
+          { sitemaps: [entry('x'.repeat(65), 'https://x.com/s.xml')] },
+          /needs an id/,
+        ],
+        [{ sitemaps: [entry('a1', '')] }, /missing its url/],
+        [{ sitemaps: [entry('a1', 'ftp://x.com/s.xml')] }, /absolute http/],
+        [{ sitemaps: [entry('a1', '/relative/s.xml')] }, /absolute http/],
+        [
+          { sitemaps: [entry('a1', 'https://x.com/' + 'y'.repeat(2048))] },
+          /too long/,
+        ],
+        [
+          { sitemaps: [{ id: 'a1', url: 'https://x.com/s.xml', enabled: 'yes' }] },
+          /must be a boolean/,
+        ],
+        [
+          {
+            sitemaps: [
+              entry('a1', 'https://x.com/s.xml'),
+              entry('a2', 'https://x.com/s.xml'),
+            ],
+          },
+          /duplicate sitemap url/,
+        ],
+        [
+          {
+            sitemaps: [
+              entry('a1', 'https://x.com/s1.xml'),
+              entry('a1', 'https://x.com/s2.xml'),
+            ],
+          },
+          /duplicate sitemap id/,
+        ],
+      ];
+      for (const [input, re] of cases) {
+        await assert.rejects(() => redisCache.setSitemaps(input), re);
+      }
+      // and the error carries the INVALID code the route maps to a 400
+      await assert.rejects(() => redisCache.setSitemaps({}), { code: 'INVALID' });
+    });
+
+    it('setSitemaps() prunes scan statuses of removed sitemaps', async function () {
+      await redisCache.setSitemapScanStatus('keep', { urlsFound: 5 });
+      await redisCache.setSitemapScanStatus('gone', { urlsFound: 9 });
+      await redisCache.setSitemaps({
+        sitemaps: [entry('keep', 'https://x.com/s.xml')],
+      });
+      const statuses = await redisCache.getSitemapScanStatuses();
+      assert.ok(statuses.keep);
+      assert.equal(statuses.gone, undefined);
+    });
+
+    it('getSitemaps() joins per-sitemap scan status and the lastscan gate', async function () {
+      await redisCache.setSitemaps({
+        sitemaps: [entry('a1', 'https://x.com/s.xml')],
+      });
+      await redisCache.setSitemapScanStatus('a1', {
+        lastScanAt: 1700000000000,
+        urlsFound: 42,
+        enqueuedNew: 7,
+        enqueuedRefresh: 3,
+        lastError: null,
+        lastErrorAt: null,
+      });
+      await redisCache.setSitemapLastScanAt(1700000000000);
+      const g = await redisCache.getSitemaps();
+      assert.equal(g.sitemaps[0].status.urlsFound, 42);
+      assert.equal(g.sitemaps[0].status.enqueuedNew, 7);
+      assert.equal(g.scan.lastScanAt, 1700000000000);
+    });
+
+    it('is read-tolerant: malformed doc keeps the last-known list, bad entries are skipped', async function () {
+      await redisCache.setSitemaps({
+        sitemaps: [entry('a1', 'https://x.com/s.xml')],
+      });
+      // a poisoned document must not take the list down
+      client._kv.set(SM_KEY, 'not json');
+      let g = await redisCache.getSitemaps();
+      assert.equal(g.sitemaps.length, 1);
+      // malformed entries are skipped, missing enabled defaults to true
+      client._kv.set(
+        SM_KEY,
+        JSON.stringify({
+          sitemaps: [
+            { id: 'ok', url: 'https://x.com/good.xml' },
+            { id: '', url: 'https://x.com/no-id.xml' },
+            { id: 'no-url' },
+            'not-an-object',
+          ],
+        }),
+      );
+      g = await redisCache.getSitemaps();
+      assert.equal(g.sitemaps.length, 1);
+      assert.equal(g.sitemaps[0].id, 'ok');
+      assert.equal(g.sitemaps[0].enabled, true);
+    });
+
+    it('returns the disabled shape / rejects writes when caching is off', async function () {
+      redisCache._setEnabledForTests(false);
+      const g = await redisCache.getSitemaps();
+      assert.deepEqual(g, { enabled: false, sitemaps: [], scan: null });
+      await assert.rejects(
+        () => redisCache.setSitemaps({ sitemaps: [] }),
+        /cache disabled/,
+      );
+    });
+
+    it('setSitemapScanStatus() merges: an error patch preserves the last good stats', async function () {
+      await redisCache.setSitemapScanStatus('a1', {
+        lastScanAt: 100,
+        lastDurationMs: 5,
+        urlsFound: 10,
+        enqueuedNew: 2,
+        enqueuedRefresh: 1,
+        lastError: null,
+        lastErrorAt: null,
+      });
+      await redisCache.setSitemapScanStatus('a1', {
+        lastError: 'sitemap HTTP 503',
+        lastErrorAt: 200,
+      });
+      let s = (await redisCache.getSitemapScanStatuses()).a1;
+      assert.equal(s.urlsFound, 10); // good stats survive the failure
+      assert.equal(s.lastError, 'sitemap HTTP 503');
+      // the next good scan clears the error
+      await redisCache.setSitemapScanStatus('a1', {
+        lastScanAt: 300,
+        lastDurationMs: 5,
+        urlsFound: 11,
+        enqueuedNew: 1,
+        enqueuedRefresh: 0,
+        lastError: null,
+        lastErrorAt: null,
+      });
+      s = (await redisCache.getSitemapScanStatuses()).a1;
+      assert.equal(s.urlsFound, 11);
+      assert.equal(s.lastError, null);
+    });
+
+    it('seeder lock: NX acquire, owner-only renew/release', async function () {
+      assert.equal(await redisCache.acquireSeederLock('me', 60000), true);
+      assert.equal(await redisCache.acquireSeederLock('other', 60000), false);
+      assert.equal(await redisCache.renewSeederLock('me', 60000), true);
+      assert.equal(await redisCache.renewSeederLock('other', 60000), false);
+      await redisCache.releaseSeederLock('other'); // not the owner -> no-op
+      assert.equal(await redisCache.acquireSeederLock('other', 60000), false);
+      await redisCache.releaseSeederLock('me');
+      assert.equal(await redisCache.acquireSeederLock('other', 60000), true);
+    });
+
+    it('lastscan gate round-trips ms and defaults to null', async function () {
+      assert.equal(await redisCache.getSitemapLastScanAt(), null);
+      await redisCache.setSitemapLastScanAt(1700000001234);
+      assert.equal(await redisCache.getSitemapLastScanAt(), 1700000001234);
+      client._kv.set(LASTSCAN_KEY, 'garbage');
+      assert.equal(await redisCache.getSitemapLastScanAt(), null);
+    });
+
+    it('getSitemapScanStatuses() skips a garbled hash field', async function () {
+      await client.hset(STATUS_KEY, 'good', JSON.stringify({ urlsFound: 1 }));
+      await client.hset(STATUS_KEY, 'bad', '{broken');
+      const statuses = await redisCache.getSitemapScanStatuses();
+      assert.equal(statuses.good.urlsFound, 1);
+      assert.equal(statuses.bad, undefined);
+    });
   });
 });
 
