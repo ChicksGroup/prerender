@@ -251,14 +251,16 @@ describe('seeder collect (sitemap expansion)', function () {
 
   it('cools down between fetches (success AND failure) but not after the last', async function () {
     const sleep = sinon.stub().resolves();
+    // LIFO traversal pops 'broken' FIRST, so the failure path genuinely gets a
+    // cooldown (work still queued behind it), and 'ok' is last (no cooldown).
     const map = {
-      root: indexXml(['broken', 'ok']),
+      root: indexXml(['ok', 'broken']),
       ok: urlsetXml([{ loc: 'https://x.com/a' }]),
     };
     seeder.start(makeServer(), makeDeps({ fetch: mapFetch(map), sleep }));
     await seeder._collect('root', { afterFetch: () => {} });
-    // 3 fetches (root, then the two children in LIFO order) -> cooldown after
-    // the first two only (the failure included), never after the queue empties
+    // 3 fetches (root -> broken fails -> ok) -> cooldown after root and after
+    // the FAILED fetch, never once the queue empties
     assert.equal(sleep.callCount, 2);
     sleep.resetHistory();
     seeder.stop();
@@ -474,6 +476,28 @@ describe('seeder scan + gating', function () {
     assert.ok(!('urlsFound' in recorded[0][1]));
   });
 
+  it('cools down between configured sitemaps, including after a failed root', async function () {
+    const sleep = sinon.stub().resolves();
+    const sms = [
+      { id: 'bad', url: 'https://x.com/bad.xml', enabled: true },
+      { id: 'good', url: 'https://x.com/good.xml', enabled: true },
+    ];
+    const map = { 'https://x.com/good.xml': urlsetXml([{ loc: 'https://x.com/a' }]) };
+    seeder.start(
+      makeServer(),
+      makeDeps({
+        fetch: mapFetch(map),
+        getSitemapList: () => Promise.resolve(sms),
+        sleep,
+      }),
+    );
+    const summary = await seeder._tickOnce();
+    assert.equal(summary.errors, 1);
+    // exactly one boundary pause: between the failed root and the next sitemap
+    // (the single-doc scans themselves trigger no within-collect cooldown)
+    assert.equal(sleep.callCount, 1);
+  });
+
   it('a failing sitemap does not stop the next one from scanning', async function () {
     const sms = [
       { id: 'bad', url: 'https://x.com/bad.xml', enabled: true },
@@ -579,6 +603,7 @@ describe('seeder scan + gating', function () {
     process.env.SEEDER_STATUS_BATCH = '1';
     const srv2 = makeServer();
     const enqueueCalls = [];
+    const recorded = [];
     const releaseLock = sinon.stub().resolves();
     seeder.stop();
     seeder.start(
@@ -597,13 +622,20 @@ describe('seeder scan + gating', function () {
           return Promise.resolve(urls.length);
         },
         getSitemapList: () => Promise.resolve([SM]),
+        recordStatus: (id, patch) => {
+          recorded.push(patch);
+          return Promise.resolve();
+        },
         releaseLock,
       }),
     );
     const summary = await seeder._tickOnce();
     assert.equal(enqueueCalls.length, 1); // only the first batch made it
     assert.ok(summary.aborted);
+    assert.equal(summary.errors, 0); // a deploy abort is not a sitemap failure
     assert.equal(releaseLock.callCount, 1);
+    // ...and it must not surface as the sitemap's lastError on the dashboard
+    assert.ok(!recorded.some((p) => p && p.lastError));
   });
 
   it('parses its env config with manager-parity defaults', function () {
