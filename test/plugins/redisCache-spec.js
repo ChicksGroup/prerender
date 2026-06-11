@@ -695,6 +695,40 @@ describe('redisCache introspection & guards', function () {
     assert.equal(client._z.size, 700);
   });
 
+  it('dueForRefresh() reaps the ghost wall in bounded-concurrency batches', async function () {
+    const now = Date.now();
+    for (let i = 0; i < 600; i += 1) {
+      const u = 'https://g/' + i;
+      client._z.set(u, now - (200 + i) * 86400e3);
+      await client.hset('prerender:v1:status', u, 404);
+    }
+    // Track concurrent evict()s by instrumenting zrem (exactly one per evict),
+    // resolving on a later microtask so a whole batch is in-flight at once.
+    let inFlight = 0;
+    let peak = 0;
+    const realZrem = client.zrem.bind(client);
+    client.zrem = (key, member) => {
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      return Promise.resolve()
+        .then(() => realZrem(key, member))
+        .then((r) => {
+          inFlight -= 1;
+          return r;
+        });
+    };
+    const due = await redisCache.dueForRefresh({
+      limit: 4,
+      refreshTtlMs: 86400e3,
+      redirectTtlMs: 7 * 86400e3,
+      now,
+    });
+    assert.deepEqual(due, []);
+    assert.equal(client._z.size, 0); // all 600 ghosts reaped
+    assert.ok(peak > 1, 'evictions run concurrently within a batch');
+    assert.ok(peak <= 64, 'concurrency is capped at the batch size (was ' + peak + ')');
+  });
+
   it('dueForRefresh() does NOT evict a 4xx whose policy action is refresh', async function () {
     redisCache._setPolicyForTests({
       '4xx': { cache: true, ttlHours: 1, onExpiry: 'refresh' },
