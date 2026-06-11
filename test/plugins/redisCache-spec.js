@@ -636,9 +636,9 @@ describe('redisCache introspection & guards', function () {
     assert.deepEqual(due, ['https://r8d/']);
   });
 
-  it('dueForRefresh() never returns a 4xx', async function () {
+  it('dueForRefresh() never returns a 4xx, and reaps the dead ghost from the index', async function () {
     const now = Date.now();
-    client._z.set('https://e/', now - 100 * 86400e3); // ancient 4xx -> still skipped
+    client._z.set('https://e/', now - 100 * 86400e3); // ancient 4xx (drop, past 24h)
     await client.hset('prerender:v1:status', 'https://e/', 404);
     const due = await redisCache.dueForRefresh({
       limit: 10,
@@ -647,6 +647,64 @@ describe('redisCache introspection & guards', function () {
       now,
     });
     assert.deepEqual(due, []);
+    // the expired 4xx is now evicted, not left to clog the index forever
+    assert.equal(client._z.has('https://e/'), false);
+    assert.equal((client._h.get('prerender:v1:status') || new Map()).has('https://e/'), false);
+  });
+
+  it('dueForRefresh() pages PAST a wall of dead 4xx ghosts to reach a due 2xx', async function () {
+    const now = Date.now();
+    // 600 ancient 4xx ghosts older than the due 2xx — more than one 500-page
+    // window, so a fixed head-window scan would never reach the 2xx.
+    for (let i = 0; i < 600; i += 1) {
+      const u = 'https://ghost/' + i;
+      client._z.set(u, now - (200 + i) * 86400e3); // all older than the 2xx below
+      await client.hset('prerender:v1:status', u, 404);
+    }
+    client._z.set('https://live/doge', now - 8 * 86400e3); // 8d-old 2xx -> due
+    await client.hset('prerender:v1:status', 'https://live/doge', 200);
+
+    const due = await redisCache.dueForRefresh({
+      limit: 4,
+      refreshTtlMs: 86400e3,
+      redirectTtlMs: 7 * 86400e3,
+      now,
+    });
+    assert.deepEqual(due, ['https://live/doge']); // reached despite the ghost wall
+    // and the whole ghost wall has been reaped
+    assert.equal(client._z.size, 1);
+    assert.equal(client._z.has('https://live/doge'), true);
+  });
+
+  it('dueForRefresh() stops reaping/scanning at maxScan (bounded per tick)', async function () {
+    const now = Date.now();
+    for (let i = 0; i < 1200; i += 1) {
+      const u = 'https://g/' + i;
+      client._z.set(u, now - (200 + i) * 86400e3);
+      await client.hset('prerender:v1:status', u, 404);
+    }
+    const due = await redisCache.dueForRefresh({
+      limit: 4,
+      maxScan: 500, // only the first 500 may be touched this tick
+      refreshTtlMs: 86400e3,
+      redirectTtlMs: 7 * 86400e3,
+      now,
+    });
+    assert.deepEqual(due, []);
+    // exactly 500 reaped this tick; the rest drain on subsequent ticks
+    assert.equal(client._z.size, 700);
+  });
+
+  it('dueForRefresh() does NOT evict a 4xx whose policy action is refresh', async function () {
+    redisCache._setPolicyForTests({
+      '4xx': { cache: true, ttlHours: 1, onExpiry: 'refresh' },
+    });
+    const now = Date.now();
+    client._z.set('https://x/nf', now - 5 * 3600000); // 5h old, ttl 1h -> due refresh
+    await client.hset('prerender:v1:status', 'https://x/nf', 404);
+    const due = await redisCache.dueForRefresh({ limit: 10, now });
+    assert.deepEqual(due, ['https://x/nf']);
+    assert.equal(client._z.has('https://x/nf'), true); // refreshed, not reaped
   });
 
   it('dueForRefresh() honors the exclude set and the limit (oldest first)', async function () {
