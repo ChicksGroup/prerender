@@ -1251,15 +1251,17 @@ describe('redisCache introspection & guards', function () {
     assert.deepEqual(due, ['https://x/r/a']);
   });
 
-  it('applies a refresh RULE only to 2xx — a 4xx under the rule drops, the 2xx refreshes', async function () {
+  it('applies a refresh RULE to 2xx and 3xx — a 4xx under the rule still drops', async function () {
     redisCache._setRulesForTests([
       { pattern: '/swap/', cache: true, ttlHours: 48, onExpiry: 'refresh' },
     ]);
     const now = Date.now();
     const old = now - 100 * 86400e3; // 100d: past the 48h rule AND the 4xx drop TTL
     client._z.set('https://chicksx.com/swap/valid', old); // 200 under the rule
+    client._z.set('https://chicksx.com/swap/redir', old); // 301 under the rule
     client._z.set('https://chicksx.com/swap/bogus', old); // 404 under the rule
     await client.hset('prerender:v1:status', 'https://chicksx.com/swap/valid', 200);
+    await client.hset('prerender:v1:status', 'https://chicksx.com/swap/redir', 301);
     await client.hset('prerender:v1:status', 'https://chicksx.com/swap/bogus', 404);
     const due = await redisCache.dueForRefresh({
       limit: 10,
@@ -1267,11 +1269,15 @@ describe('redisCache introspection & guards', function () {
       redirectTtlMs: 7 * 86400e3,
       now,
     });
-    // the 200 is refreshed on the rule; the 404 is NOT (it follows the 4xx class)
-    assert.deepEqual(due, ['https://chicksx.com/swap/valid']);
-    // and the 404 is dropped/evicted (the whole point — the rule no longer keeps it alive)
+    // the 200 AND the 301 refresh on the rule; the 404 does NOT (it follows the 4xx class)
+    assert.deepEqual(due.sort(), [
+      'https://chicksx.com/swap/redir',
+      'https://chicksx.com/swap/valid',
+    ]);
+    // and the 404 is dropped/evicted (the rule no longer keeps it alive)
     assert.equal(client._z.has('https://chicksx.com/swap/bogus'), false);
-    assert.equal(client._z.has('https://chicksx.com/swap/valid'), true); // 200 kept + refreshed
+    assert.equal(client._z.has('https://chicksx.com/swap/valid'), true); // 2xx kept + refreshed
+    assert.equal(client._z.has('https://chicksx.com/swap/redir'), true); // 3xx kept + refreshed
   });
 
   it('previewPattern returns total/matched/sample and rejects a bad regex', async function () {
