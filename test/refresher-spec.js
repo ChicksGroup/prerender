@@ -179,6 +179,118 @@ describe('refresher queue consumption', function () {
   });
 });
 
+describe('refresher failure cooldown', function () {
+  afterEach(function () {
+    refresher.stop();
+    delete process.env.REFRESHER_CONCURRENCY;
+    delete process.env.REFRESHER_FAIL_COOLDOWN_MS;
+  });
+
+  const flush = () => new Promise((r) => setImmediate(r));
+
+  it('parks a refresh URL that 504s and advances to healthy work next tick', async function () {
+    process.env.REFRESHER_CONCURRENCY = '1';
+    const rendered = [];
+    const render = (u) => {
+      rendered.push(u);
+      return Promise.resolve(u === 'broken' ? 504 : 200);
+    };
+    // oldest-first: 'broken' would be picked every tick without the cooldown.
+    const due = ({ limit, exclude }) =>
+      Promise.resolve(['broken', 'good'].filter((u) => !exclude.has(u)).slice(0, limit));
+    refresher.start(makeServer(0), 3000, { render, dueForRefresh: due, manual: true });
+
+    await refresher._tickOnce(); // picks 'broken', renders 504
+    await flush();
+    assert.ok(refresher._failedUntil().has('broken'), 'broken URL is parked');
+
+    await refresher._tickOnce(); // 'broken' excluded -> picks 'good'
+    await flush();
+    assert.deepEqual(rendered, ['broken', 'good']); // did NOT crashloop on 'broken'
+  });
+
+  it('parks a refresh URL whose render throws', async function () {
+    process.env.REFRESHER_CONCURRENCY = '1';
+    const due = ({ limit, exclude }) =>
+      Promise.resolve(['x'].filter((u) => !exclude.has(u)).slice(0, limit));
+    refresher.start(makeServer(0), 3000, {
+      render: () => Promise.reject(new Error('boom')),
+      dueForRefresh: due,
+      manual: true,
+    });
+    await refresher._tickOnce();
+    await flush();
+    assert.ok(refresher._failedUntil().has('x'));
+  });
+
+  it('does NOT park a URL shed for backpressure (429/503)', async function () {
+    process.env.REFRESHER_CONCURRENCY = '1';
+    const due = ({ limit, exclude }) =>
+      Promise.resolve(['x'].filter((u) => !exclude.has(u)).slice(0, limit));
+    refresher.start(makeServer(0), 3000, {
+      render: () => Promise.resolve(429),
+      dueForRefresh: due,
+      manual: true,
+    });
+    await refresher._tickOnce();
+    await flush();
+    assert.equal(refresher._failedUntil().has('x'), false);
+  });
+
+  it('a successful render clears a prior failure cooldown', async function () {
+    process.env.REFRESHER_CONCURRENCY = '2';
+    let val = 504;
+    let q = ['x'];
+    // Drive 'x' through the QUEUE (dequeue ignores the cooldown), so we can fail
+    // it then succeed it and observe the cooldown being cleared.
+    refresher.start(makeServer(0), 3000, {
+      render: () => Promise.resolve(val),
+      dequeue: (n) => Promise.resolve(q.slice(0, n)),
+      dueForRefresh: () => Promise.resolve([]),
+      requeue: () => {},
+      clearAttempt: () => {},
+      manual: true,
+    });
+    await refresher._tickOnce(); // queue 'x' -> 504 -> parked
+    await flush();
+    assert.ok(refresher._failedUntil().has('x'));
+
+    val = 200;
+    q = ['x'];
+    await refresher._tickOnce(); // queue 'x' -> 200 -> clears parking
+    await flush();
+    assert.equal(refresher._failedUntil().has('x'), false);
+  });
+
+  it('normalizes a render the server flagged as failed (x-prerender-504-reason) to 504', function () {
+    const c = refresher._classifyLoopbackStatus;
+    // a page-load timeout with TIMEOUT_STATUS_CODE unset comes back 200 + reason
+    assert.equal(c(200, { 'x-prerender-504-reason': 'page load timed out' }), 504);
+    // already-5xx (TIMEOUT_STATUS_CODE=504 set) passes through unchanged
+    assert.equal(c(504, { 'x-prerender-504-reason': 'page load timed out' }), 504);
+    // healthy renders and backpressure are untouched
+    assert.equal(c(200, {}), 200);
+    assert.equal(c(301, {}), 301);
+    assert.equal(c(429, {}), 429);
+    assert.equal(c(503, {}), 503);
+  });
+
+  it('does not park anything when the cooldown is disabled (0)', async function () {
+    process.env.REFRESHER_CONCURRENCY = '1';
+    process.env.REFRESHER_FAIL_COOLDOWN_MS = '0';
+    const due = ({ limit, exclude }) =>
+      Promise.resolve(['x'].filter((u) => !exclude.has(u)).slice(0, limit));
+    refresher.start(makeServer(0), 3000, {
+      render: () => Promise.resolve(504),
+      dueForRefresh: due,
+      manual: true,
+    });
+    await refresher._tickOnce();
+    await flush();
+    assert.equal(refresher._failedUntil().size, 0);
+  });
+});
+
 describe('refresher adaptive concurrency', function () {
   function startAdaptive(min, max) {
     process.env.REFRESHER_ADAPTIVE = 'true';
