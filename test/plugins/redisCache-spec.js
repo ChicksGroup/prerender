@@ -1280,6 +1280,54 @@ describe('redisCache introspection & guards', function () {
     assert.equal(client._z.has('https://chicksx.com/swap/redir'), true); // 3xx kept + refreshed
   });
 
+  it('dueForRefresh prioritizes due 2xx over due 3xx (fresh content beats stale redirects)', async function () {
+    const now = Date.now();
+    // the 3xx is OLDER (more overdue) than the 2xx — plain oldest-first would pick
+    // it; with prioritization the 2xx wins the single slot.
+    client._z.set('https://x/redir', now - 30 * 86400e3); // 30d-old 3xx (due)
+    client._z.set('https://x/page', now - 2 * 86400e3); // 2d-old 2xx (due, but newer)
+    await client.hset('prerender:v1:status', 'https://x/redir', 301);
+    await client.hset('prerender:v1:status', 'https://x/page', 200);
+    const due = await redisCache.dueForRefresh({
+      limit: 1,
+      refreshTtlMs: 86400e3,
+      redirectTtlMs: 7 * 86400e3,
+      now,
+    });
+    assert.deepEqual(due, ['https://x/page']); // 2xx wins despite being newer
+  });
+
+  it('dueForRefresh fills leftover slots with due 3xx after the due 2xx', async function () {
+    const now = Date.now();
+    client._z.set('https://x/r1', now - 30 * 86400e3); // 3xx due (older)
+    client._z.set('https://x/p1', now - 2 * 86400e3); // 2xx due (newer)
+    await client.hset('prerender:v1:status', 'https://x/r1', 301);
+    await client.hset('prerender:v1:status', 'https://x/p1', 200);
+    const due = await redisCache.dueForRefresh({
+      limit: 5,
+      refreshTtlMs: 86400e3,
+      redirectTtlMs: 7 * 86400e3,
+      now,
+    });
+    assert.deepEqual(due, ['https://x/p1', 'https://x/r1']); // 2xx first, 3xx fills leftover
+  });
+
+  it('dueForRefresh prioritize2xx:false is plain oldest-first (3xx before 2xx)', async function () {
+    const now = Date.now();
+    client._z.set('https://x/redir', now - 30 * 86400e3);
+    client._z.set('https://x/page', now - 2 * 86400e3);
+    await client.hset('prerender:v1:status', 'https://x/redir', 301);
+    await client.hset('prerender:v1:status', 'https://x/page', 200);
+    const due = await redisCache.dueForRefresh({
+      limit: 1,
+      prioritize2xx: false,
+      refreshTtlMs: 86400e3,
+      redirectTtlMs: 7 * 86400e3,
+      now,
+    });
+    assert.deepEqual(due, ['https://x/redir']); // oldest-first -> the older 3xx
+  });
+
   it('previewPattern returns total/matched/sample and rejects a bad regex', async function () {
     client._z.set('https://x/sell/a', 100);
     client._z.set('https://x/sell/b', 200);
