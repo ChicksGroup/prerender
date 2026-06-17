@@ -291,6 +291,164 @@ describe('refresher failure cooldown', function () {
   });
 });
 
+describe('refresher cross-instance dedupe', function () {
+  afterEach(function () {
+    refresher.stop();
+    delete process.env.REFRESHER_CONCURRENCY;
+    delete process.env.REFRESHER_CLAIM_TTL_MS;
+  });
+
+  const flush = () => new Promise((r) => setImmediate(r));
+
+  it('skips refresh URLs another box already holds and claims the rest', async function () {
+    process.env.REFRESHER_CONCURRENCY = '2';
+    const launched = [];
+    // 'taken' is held by another instance; everything else is claimable.
+    const claim = (url) => Promise.resolve(url !== 'taken');
+    const due = ({ limit, exclude }) =>
+      Promise.resolve(
+        ['taken', 'a', 'b', 'c'].filter((u) => !exclude.has(u)).slice(0, limit),
+      );
+    refresher.start(makeServer(0), 3000, {
+      render: (u) => {
+        launched.push(u);
+        return pendingRender();
+      },
+      dueForRefresh: due,
+      claim,
+      release: () => {},
+      manual: true,
+    });
+    await refresher._tickOnce();
+    assert.deepEqual(launched.sort(), ['a', 'b']); // 'taken' skipped, slots filled
+  });
+
+  it('releases its refresh claim once the render settles', async function () {
+    process.env.REFRESHER_CONCURRENCY = '1';
+    const released = [];
+    let resolveRender;
+    const render = () =>
+      new Promise((res) => {
+        resolveRender = res;
+      });
+    const due = ({ limit, exclude }) =>
+      Promise.resolve(['a'].filter((u) => !exclude.has(u)).slice(0, limit));
+    refresher.start(makeServer(0), 3000, {
+      render,
+      dueForRefresh: due,
+      claim: () => Promise.resolve(true),
+      release: (u) => released.push(u),
+      manual: true,
+    });
+    await refresher._tickOnce();
+    assert.deepEqual([...refresher._inProgress()], ['a']);
+    resolveRender(200);
+    await flush();
+    assert.deepEqual(released, ['a']);
+  });
+
+  it('does not claim or release when dedupe is disabled (claimTtlMs=0)', async function () {
+    process.env.REFRESHER_CONCURRENCY = '2';
+    process.env.REFRESHER_CLAIM_TTL_MS = '0';
+    let claims = 0;
+    const due = ({ limit, exclude }) =>
+      Promise.resolve(['a', 'b'].filter((u) => !exclude.has(u)).slice(0, limit));
+    refresher.start(makeServer(0), 3000, {
+      render: pendingRender,
+      dueForRefresh: due,
+      claim: () => {
+        claims += 1;
+        return Promise.resolve(true);
+      },
+      release: () => {},
+      manual: true,
+    });
+    await refresher._tickOnce();
+    assert.equal(claims, 0);
+    assert.equal(refresher._inProgress().size, 2);
+  });
+
+  it('does not over-claim: only claims as many as it will launch', async function () {
+    process.env.REFRESHER_CONCURRENCY = '1';
+    const claimedUrls = [];
+    const claim = (url) => {
+      claimedUrls.push(url);
+      return Promise.resolve(true);
+    };
+    const due = ({ limit, exclude }) =>
+      Promise.resolve(
+        ['a', 'b', 'c', 'd'].filter((u) => !exclude.has(u)).slice(0, limit),
+      );
+    refresher.start(makeServer(0), 3000, {
+      render: pendingRender,
+      dueForRefresh: due,
+      claim,
+      release: () => {},
+      manual: true,
+    });
+    await refresher._tickOnce(); // 1 free slot -> claim exactly 1, not the whole over-fetch
+    assert.deepEqual(claimedUrls, ['a']);
+  });
+
+  it('holds a failed refresh URL claim for the cooldown instead of releasing it', async function () {
+    process.env.REFRESHER_CONCURRENCY = '1';
+    const released = [];
+    const extended = [];
+    const due = ({ limit, exclude }) =>
+      Promise.resolve(['a'].filter((u) => !exclude.has(u)).slice(0, limit));
+    refresher.start(makeServer(0), 3000, {
+      render: () => Promise.resolve(504), // failed render
+      dueForRefresh: due,
+      claim: () => Promise.resolve(true),
+      release: (u) => released.push(u),
+      extend: (u, ttl) => extended.push([u, ttl]),
+      manual: true,
+    });
+    await refresher._tickOnce();
+    await flush();
+    // held cluster-wide for failCooldownMs (default 10 min), NOT released
+    assert.deepEqual(extended, [['a', 600000]]);
+    assert.deepEqual(released, []);
+  });
+
+  it('releases (does not leak) a redundant claim when the URL is already rendering', async function () {
+    process.env.REFRESHER_CONCURRENCY = '2';
+    const released = [];
+    refresher.start(makeServer(0), 3000, {
+      render: pendingRender,
+      // same URL arrives via BOTH the queue and the index this tick
+      dequeue: (n) => Promise.resolve(['x'].slice(0, n)),
+      dueForRefresh: ({ limit, exclude }) =>
+        Promise.resolve(['x'].filter((u) => !exclude.has(u)).slice(0, limit)),
+      claim: () => Promise.resolve(true),
+      release: (u) => released.push(u),
+      requeue: () => {},
+      clearAttempt: () => {},
+      manual: true,
+    });
+    await refresher._tickOnce();
+    assert.deepEqual([...refresher._inProgress()], ['x']); // launched once (queue)
+    assert.deepEqual(released, ['x']); // the duplicate refresh claim was released
+  });
+
+  it('does not idle-sleep when due work exists but is all claimed elsewhere', async function () {
+    process.env.REFRESHER_CONCURRENCY = '1';
+    const due = ({ limit, exclude }) =>
+      Promise.resolve(['a', 'b', 'c'].filter((u) => !exclude.has(u)).slice(0, limit));
+    refresher.start(makeServer(0), 3000, {
+      render: pendingRender,
+      dueForRefresh: due,
+      claim: () => Promise.resolve(false), // every candidate held by another box
+      release: () => {},
+      extend: () => {},
+      manual: true,
+    });
+    const r = await refresher._tickOnce();
+    assert.equal(r.idle, false); // candidates existed -> short retry, not a 60s sleep
+    assert.equal(refresher._inProgress().size, 0); // nothing claimed -> nothing launched
+  });
+});
+
 describe('refresher adaptive concurrency', function () {
   function startAdaptive(min, max) {
     process.env.REFRESHER_ADAPTIVE = 'true';

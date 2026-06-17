@@ -759,6 +759,17 @@ describe('redisCache introspection & guards', function () {
     );
   });
 
+  it('claimRefresh is exclusive per URL and releaseRefresh frees it', async function () {
+    const url = 'https://chicksx.com/swap/fiat/usd-to-ron';
+    assert.equal(await redisCache.claimRefresh(url, 'box1', 60000), true);
+    assert.equal(await redisCache.claimRefresh(url, 'box2', 60000), false); // held by box1
+    // box2 cannot release box1's claim (compare-and-del on the token)
+    await redisCache.releaseRefresh(url, 'box2');
+    assert.equal(await redisCache.claimRefresh(url, 'box2', 60000), false); // still held
+    await redisCache.releaseRefresh(url, 'box1'); // owner releases
+    assert.equal(await redisCache.claimRefresh(url, 'box2', 60000), true); // now free
+  });
+
   it('dueForRefresh() does NOT evict a 4xx whose policy action is refresh', async function () {
     redisCache._setPolicyForTests({
       '4xx': { cache: true, ttlHours: 1, onExpiry: 'refresh' },
