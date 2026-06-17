@@ -729,6 +729,36 @@ describe('redisCache introspection & guards', function () {
     assert.ok(peak <= 64, 'concurrency is capped at the batch size (was ' + peak + ')');
   });
 
+  it('dueForRefresh() never returns a no-render URL, and reaps its pre-rule ghost', async function () {
+    // A page cached as a 2xx BEFORE a no-render rule was added: its index entry
+    // outlives the rule (no-render renders persist nothing), so without this it
+    // would be returned as "due" every tick and re-rendered into an instant
+    // short-circuit forever — the 403 busy-loop seen on the scheduled box.
+    redisCache._setNoRenderRulesForTests([
+      { pattern: '/customer-portal/', statusCode: 403 },
+    ]);
+    const now = Date.now();
+    client._z.set('https://chicksgold.com/customer-portal/sold/chat/1', now - 2 * 86400e3);
+    client._z.set('https://chicksgold.com/buy/doge', now - 2 * 86400e3); // real due 2xx
+    await client.hset('prerender:v1:status', 'https://chicksgold.com/customer-portal/sold/chat/1', 200);
+    await client.hset('prerender:v1:status', 'https://chicksgold.com/buy/doge', 200);
+    const due = await redisCache.dueForRefresh({
+      limit: 10,
+      refreshTtlMs: 86400e3,
+      redirectTtlMs: 7 * 86400e3,
+      now,
+    });
+    assert.deepEqual(due, ['https://chicksgold.com/buy/doge']); // no-render URL excluded
+    // and its ghost is reaped from the index so it stops being scanned
+    assert.equal(client._z.has('https://chicksgold.com/customer-portal/sold/chat/1'), false);
+    assert.equal(
+      (client._h.get('prerender:v1:status') || new Map()).has(
+        'https://chicksgold.com/customer-portal/sold/chat/1',
+      ),
+      false,
+    );
+  });
+
   it('dueForRefresh() does NOT evict a 4xx whose policy action is refresh', async function () {
     redisCache._setPolicyForTests({
       '4xx': { cache: true, ttlHours: 1, onExpiry: 'refresh' },
