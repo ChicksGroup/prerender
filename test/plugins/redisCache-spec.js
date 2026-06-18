@@ -1328,6 +1328,51 @@ describe('redisCache introspection & guards', function () {
     assert.deepEqual(due, ['https://x/redir']); // oldest-first -> the older 3xx
   });
 
+  it('reapExpired evicts expired 4xx + no-render ghosts, keeps live 2xx/3xx', async function () {
+    redisCache._setNoRenderRulesForTests([{ pattern: '/admin/', statusCode: 410 }]);
+    const now = Date.now();
+    client._z.set('https://x/old404', now - 100 * 86400e3); // ancient 4xx (drop) -> evict
+    client._z.set('https://x/new404', now - 60e3); // fresh 4xx -> keep
+    client._z.set('https://x/page', now - 100 * 86400e3); // old 2xx (refresh, never expires) -> keep
+    client._z.set('https://x/redir', now - 100 * 86400e3); // old 3xx -> keep
+    client._z.set('https://x/admin/panel', now - 60e3); // no-render match -> evict regardless of age
+    await client.hset('prerender:v1:status', 'https://x/old404', 404);
+    await client.hset('prerender:v1:status', 'https://x/new404', 404);
+    await client.hset('prerender:v1:status', 'https://x/page', 200);
+    await client.hset('prerender:v1:status', 'https://x/redir', 301);
+    await client.hset('prerender:v1:status', 'https://x/admin/panel', 200);
+    const r = await redisCache.reapExpired({ maxScan: 1000, maxEvict: 1000 });
+    assert.equal(r.reaped, 2); // old404 + admin/panel
+    assert.equal(client._z.has('https://x/old404'), false);
+    assert.equal(client._z.has('https://x/admin/panel'), false);
+    assert.equal(client._z.has('https://x/new404'), true);
+    assert.equal(client._z.has('https://x/page'), true); // old but live -> not the reaper's job
+    assert.equal(client._z.has('https://x/redir'), true);
+  });
+
+  it('reapExpired respects maxEvict (bounded deletions per pass)', async function () {
+    const now = Date.now();
+    for (let i = 0; i < 10; i += 1) {
+      const u = 'https://x/g' + i;
+      client._z.set(u, now - 100 * 86400e3);
+      await client.hset('prerender:v1:status', u, 404);
+    }
+    const r = await redisCache.reapExpired({ maxScan: 1000, maxEvict: 3 });
+    assert.equal(r.reaped, 3);
+    assert.equal(client._z.size, 7); // only 3 evicted this pass
+  });
+
+  it('reapExpired is cluster-locked: skips when another instance holds the lock', async function () {
+    await client.set('prerender:v1:reaplock', 'other-box', 'PX', 60000, 'NX');
+    const now = Date.now();
+    client._z.set('https://x/old404', now - 100 * 86400e3);
+    await client.hset('prerender:v1:status', 'https://x/old404', 404);
+    const r = await redisCache.reapExpired({ maxScan: 100, maxEvict: 100 });
+    assert.equal(r.skipped, true);
+    assert.equal(r.reaped, 0);
+    assert.equal(client._z.has('https://x/old404'), true); // untouched while locked
+  });
+
   it('previewPattern returns total/matched/sample and rejects a bad regex', async function () {
     client._z.set('https://x/sell/a', 100);
     client._z.set('https://x/sell/b', 200);

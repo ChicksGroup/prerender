@@ -449,6 +449,53 @@ describe('refresher cross-instance dedupe', function () {
   });
 });
 
+describe('refresher background reaper', function () {
+  afterEach(function () {
+    refresher.stop();
+    delete process.env.REFRESHER_CONCURRENCY;
+    delete process.env.REFRESHER_REAP_INTERVAL_MS;
+  });
+  const flush = () => new Promise((r) => setImmediate(r));
+
+  it('reapTick calls reapExpired with the configured bounds', async function () {
+    let got = null;
+    refresher.start(makeServer(0), 3000, {
+      render: pendingRender,
+      dueForRefresh: () => Promise.resolve([]),
+      reap: (o) => { got = o; return Promise.resolve({ reaped: 5, scanned: 100 }); },
+      manual: true,
+    });
+    refresher._reapTick();
+    await flush();
+    assert.ok(got, 'reap dep was called');
+    assert.ok(got.maxScan > 0 && got.maxEvict > 0);
+  });
+
+  it('reapTick does not overlap a still-running pass', async function () {
+    let calls = 0;
+    let release;
+    refresher.start(makeServer(0), 3000, {
+      render: pendingRender,
+      dueForRefresh: () => Promise.resolve([]),
+      reap: () => { calls += 1; return new Promise((r) => { release = r; }); },
+      manual: true,
+    });
+    refresher._reapTick(); // starts a pass
+    await flush(); // let reapFn get invoked (it stays pending until released)
+    assert.equal(calls, 1);
+    assert.equal(refresher._reapInProgress(), true);
+    refresher._reapTick(); // in progress -> skipped
+    await flush();
+    assert.equal(calls, 1);
+    release({ reaped: 0 });
+    await flush();
+    assert.equal(refresher._reapInProgress(), false);
+    refresher._reapTick(); // free now -> runs again
+    await flush();
+    assert.equal(calls, 2);
+  });
+});
+
 describe('refresher adaptive concurrency', function () {
   function startAdaptive(min, max) {
     process.env.REFRESHER_ADAPTIVE = 'true';
