@@ -304,7 +304,7 @@ describe('redisCache plugin', function () {
       assert(next.calledOnce);
     });
 
-    it('does NOT store a dirty render (5xx subresource)', async function () {
+    it('does NOT store a dirty render (5xx subresource), and flags the skip reason', async function () {
       const req = makeReq({
         prerender: {
           _cacheLockOwner: true,
@@ -313,6 +313,8 @@ describe('redisCache plugin', function () {
       });
       await redisCache.beforeSend(req, res, next);
       assert(client.set.notCalled);
+      // surfaced so _send emits x-prerender-cache-skip and the refresher parks it
+      assert.equal(req.prerender._cacheSkipReason, 'dirtyRender');
     });
 
     it('does NOT store a 5xx status', async function () {
@@ -768,6 +770,34 @@ describe('redisCache introspection & guards', function () {
     assert.equal(await redisCache.claimRefresh(url, 'box2', 60000), false); // still held
     await redisCache.releaseRefresh(url, 'box1'); // owner releases
     assert.equal(await redisCache.claimRefresh(url, 'box2', 60000), true); // now free
+  });
+
+  it('dueForRefresh() evicts a non-canonical (trailing-whitespace) ghost key', async function () {
+    const now = Date.now();
+    // util.getUrl strips the trailing space -> this key can never re-score on
+    // refresh (the render stores the canonical key) -> it loops. Reap it.
+    client._z.set('https://x/privacy-policy ', now - 100 * 86400e3);
+    client._z.set('https://x/page', now - 2 * 86400e3); // canonical due 2xx
+    await client.hset('prerender:v1:status', 'https://x/privacy-policy ', 200);
+    await client.hset('prerender:v1:status', 'https://x/page', 200);
+    const due = await redisCache.dueForRefresh({
+      limit: 10,
+      refreshTtlMs: 86400e3,
+      redirectTtlMs: 7 * 86400e3,
+      now,
+    });
+    assert.deepEqual(due, ['https://x/page']); // ghost not returned
+    assert.equal(client._z.has('https://x/privacy-policy '), false); // evicted
+    assert.equal(client._z.has('https://x/page'), true);
+  });
+
+  it('reapExpired() evicts a non-canonical (trailing-whitespace) ghost key', async function () {
+    const now = Date.now();
+    client._z.set('https://x/privacy-policy ', now - 60e3); // recent, NOT expired by TTL
+    await client.hset('prerender:v1:status', 'https://x/privacy-policy ', 200);
+    const r = await redisCache.reapExpired({ maxScan: 100, maxEvict: 100 });
+    assert.equal(r.reaped, 1); // reaped despite being a fresh 200 — it's non-canonical
+    assert.equal(client._z.has('https://x/privacy-policy '), false);
   });
 
   it('dueForRefresh() does NOT evict a 4xx whose policy action is refresh', async function () {

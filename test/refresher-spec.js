@@ -275,6 +275,19 @@ describe('refresher failure cooldown', function () {
     assert.equal(c(503, {}), 503);
   });
 
+  it('normalizes a store-skipped render (x-prerender-cache-skip) to 504 so it parks', function () {
+    const c = refresher._classifyLoopbackStatus;
+    // 200/301 the cache refused to store -> would loop forever -> park
+    assert.equal(c(200, { 'x-prerender-cache-skip': 'dirtyRender' }), 504);
+    assert.equal(c(200, { 'x-prerender-cache-skip': 'tooSmall' }), 504);
+    assert.equal(c(301, { 'x-prerender-cache-skip': 'empty' }), 504);
+    // backpressure store-skip (408/429) should retry, NOT park
+    assert.equal(c(200, { 'x-prerender-cache-skip': 'transient' }), 200);
+    assert.equal(c(429, { 'x-prerender-cache-skip': 'transient' }), 429);
+    // a clean store is untouched
+    assert.equal(c(200, {}), 200);
+  });
+
   it('does not park anything when the cooldown is disabled (0)', async function () {
     process.env.REFRESHER_CONCURRENCY = '1';
     process.env.REFRESHER_FAIL_COOLDOWN_MS = '0';
