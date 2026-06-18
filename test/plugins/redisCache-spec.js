@@ -1392,6 +1392,57 @@ describe('redisCache introspection & guards', function () {
     assert.equal(client._z.size, 7); // only 3 evicted this pass
   });
 
+  it('reapExpired resume-pages: pass 2 sweeps past the first maxScan window to a buried ghost', async function () {
+    const now = Date.now();
+    // 550 old-but-live 3xx (refresh-class, never reaped) form a "wall" at the head
+    // of the index. A single maxScan=500 pass scans only the wall and can't see
+    // past it — exactly why a fixed head-only sweep needed a huge maxScan.
+    for (let i = 0; i < 550; i += 1) {
+      const u = 'https://x/r' + String(i).padStart(4, '0');
+      client._z.set(u, now - 365 * 86400e3 + i); // ~365d old, distinct ascending order
+      await client.hset('prerender:v1:status', u, 301);
+    }
+    // An expired 4xx buried behind the wall: newer storedAt than the wall (so it
+    // sorts to rank ~550) but still well past its drop TTL.
+    const ghost = 'https://x/buried-404';
+    client._z.set(ghost, now - 100 * 86400e3);
+    await client.hset('prerender:v1:status', ghost, 404);
+
+    const opts = { maxScan: 500, maxEvict: 100 };
+    const p1 = await redisCache.reapExpired(opts);
+    assert.equal(p1.reaped, 0); // pass 1 only saw the live-3xx wall
+    assert.equal(p1.wrapped, false); // stopped on maxScan, not end-of-index
+    assert.equal(client._z.has(ghost), true); // not reached yet
+
+    // The resume cursor advanced past the wall, so pass 2 sweeps to the ghost.
+    const p2 = await redisCache.reapExpired(opts);
+    assert.ok(p2.reaped >= 1);
+    assert.equal(client._z.has(ghost), false); // reaped on the second pass
+  });
+
+  it('reapExpired fromStart scans from the head and re-bases the resume cursor', async function () {
+    const now = Date.now();
+    // (a) Seed a cursor as if a prior resume pass had advanced past the head.
+    await client.set('prerender:v1:reapcursor', '999');
+    client._z.set('https://x/old404', now - 100 * 86400e3); // rank 0, expired 4xx
+    await client.hset('prerender:v1:status', 'https://x/old404', 404);
+    // fromStart scans from 0 (the cursor=999 would otherwise skip it).
+    const r = await redisCache.reapExpired({ maxScan: 100, maxEvict: 100, fromStart: true });
+    assert.equal(r.reaped, 1);
+    assert.equal(client._z.has('https://x/old404'), false);
+    // An evicting drain shifts ranks below the periodic cursor, so reset it to 0 —
+    // the next periodic pass re-sweeps the head instead of skipping shifted entries.
+    assert.equal(await client.get('prerender:v1:reapcursor'), '0');
+
+    // (b) A no-op fromStart drain (nothing to evict) leaves the cursor untouched.
+    await client.set('prerender:v1:reapcursor', '777');
+    client._z.set('https://x/live', now - 60e3); // fresh 2xx -> not reaped
+    await client.hset('prerender:v1:status', 'https://x/live', 200);
+    const r2 = await redisCache.reapExpired({ maxScan: 100, maxEvict: 100, fromStart: true });
+    assert.equal(r2.reaped, 0);
+    assert.equal(await client.get('prerender:v1:reapcursor'), '777');
+  });
+
   it('reapExpired is cluster-locked: skips when another instance holds the lock', async function () {
     await client.set('prerender:v1:reaplock', 'other-box', 'PX', 60000, 'NX');
     const now = Date.now();
