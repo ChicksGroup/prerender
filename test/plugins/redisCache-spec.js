@@ -1826,6 +1826,34 @@ describe('redisCache introspection & guards', function () {
     assert.deepEqual(cx.statusCounts, { 200: 2, 301: 1 });
   });
 
+  it('statsByDomain() reports within-policy vs stale freshness per class (rule-aware)', async function () {
+    redisCache._setPolicyForTests({
+      '2xx': { cache: true, ttlHours: 24, onExpiry: 'refresh' },
+      '3xx': { cache: true, ttlHours: 168, onExpiry: 'refresh' },
+      '4xx': { cache: true, ttlHours: 168, onExpiry: 'drop' },
+    });
+    // A per-URL rule: /swap/* 2xx stay fresh for 48h (longer than the 24h class).
+    redisCache._setRulesForTests([
+      { pattern: 'https://x/swap/', ttlHours: 48, onExpiry: 'refresh' },
+    ]);
+    const now = Date.now();
+    client._z.set('https://x/fresh', now - 1 * 3600e3); // 1h 200 -> fresh (<24h)
+    client._z.set('https://x/stale', now - 30 * 3600e3); // 30h 200 -> stale (>24h)
+    client._z.set('https://x/swap/aed-to-try', now - 30 * 3600e3); // 30h, but 48h rule -> fresh
+    client._z.set('https://x/r', now - 2 * 3600e3); // 2h 301 -> fresh (<168h)
+    client._z.set('https://x/old404', now - 200 * 3600e3); // 200h 404 -> stale (>168h)
+    await client.hset('prerender:v1:status', 'https://x/fresh', 200);
+    await client.hset('prerender:v1:status', 'https://x/stale', 200);
+    await client.hset('prerender:v1:status', 'https://x/swap/aed-to-try', 200);
+    await client.hset('prerender:v1:status', 'https://x/r', 301);
+    await client.hset('prerender:v1:status', 'https://x/old404', 404);
+    const s = await redisCache.statsByDomain();
+    // 2xx: fresh + swap(rule-fresh) = 2 fresh, stale = 1
+    assert.deepEqual(s.global.freshness['2xx'], { total: 3, fresh: 2, stale: 1 });
+    assert.deepEqual(s.global.freshness['3xx'], { total: 1, fresh: 1, stale: 0 });
+    assert.deepEqual(s.global.freshness['4xx'], { total: 1, fresh: 0, stale: 1 });
+  });
+
   it('statsByDomain() omits entries with no recorded status from statusCounts', async function () {
     client._z.set('https://www.chicksx.com/nostatus', Date.now());
     const s = await redisCache.statsByDomain();
