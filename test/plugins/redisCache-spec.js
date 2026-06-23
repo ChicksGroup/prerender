@@ -446,12 +446,47 @@ describe('redisCache introspection & guards', function () {
         kv.set(k, v);
         return Promise.resolve('OK');
       },
-      zadd: (key, score, member) => {
+      zadd: (key, ...rest) => {
+        // Two forms: (key, score, member) and (key, 'NX', score, member). The
+        // queue/producer paths use NX (keep an already-present member's score).
+        let nx = false;
+        let score;
+        let member;
+        if (typeof rest[0] === 'string' && /^(NX|XX|GT|LT|CH)$/.test(rest[0])) {
+          nx = rest[0] === 'NX';
+          [, score, member] = rest;
+        } else {
+          [score, member] = rest;
+        }
+        if (nx && z.has(member)) return Promise.resolve(0);
         z.set(member, Number(score));
         return Promise.resolve(1);
       },
       zscore: (key, member) =>
         Promise.resolve(z.has(member) ? String(z.get(member)) : null),
+      zmscore: (key, ...members) =>
+        Promise.resolve(members.map((m) => (z.has(m) ? String(z.get(m)) : null))),
+      zpopmin: (key, count) => {
+        const n = Math.max(1, count || 1);
+        const out = [];
+        for (const [m, s] of sortedAsc().slice(0, n)) {
+          z.delete(m);
+          out.push(m, String(s));
+        }
+        return Promise.resolve(out);
+      },
+      zremrangebyscore: (key, min, max) => {
+        const minN = min === '-inf' ? -Infinity : Number(min);
+        const maxN = max === '+inf' ? Infinity : Number(max);
+        let removed = 0;
+        for (const [m, s] of [...z.entries()]) {
+          if (s >= minN && s <= maxN) {
+            z.delete(m);
+            removed += 1;
+          }
+        }
+        return Promise.resolve(removed);
+      },
       zcard: () => Promise.resolve(z.size),
       zrange: (key, start, stop, ws) => {
         const arr = sortedAsc();
@@ -1452,6 +1487,75 @@ describe('redisCache introspection & guards', function () {
     assert.equal(r.skipped, true);
     assert.equal(r.reaped, 0);
     assert.equal(client._z.has('https://x/old404'), true); // untouched while locked
+  });
+
+  it('dueForRefresh classified returns 2xx and low buckets apart + scan counts', async function () {
+    const now = Date.now();
+    const day = 86400e3;
+    client._z.set('https://x/a', now - 2 * day); // due 2xx
+    client._z.set('https://x/r', now - 8 * day); // due 3xx (older -> ranks first)
+    await client.hset('prerender:v1:status', 'https://x/a', 200);
+    await client.hset('prerender:v1:status', 'https://x/r', 301);
+    const sel = await redisCache.dueForRefresh({ classified: true, limit: 10, now });
+    assert.deepEqual(sel.p2xx, ['https://x/a']);
+    assert.deepEqual(sel.plow, ['https://x/r']);
+    assert.equal(sel.scanned, 2);
+    assert.equal(sel.evicted, 0);
+  });
+
+  it('suppressRefeed + suppressedSet: only members with score > now are suppressed', async function () {
+    const now = 1_000_000;
+    await redisCache.suppressRefeed('https://x/inflight', now + 5000);
+    await redisCache.suppressRefeed('https://x/expired', now - 1);
+    const s = await redisCache.suppressedSet(
+      ['https://x/inflight', 'https://x/expired', 'https://x/unknown'],
+      now,
+    );
+    assert.equal(s.has('https://x/inflight'), true);
+    assert.equal(s.has('https://x/expired'), false); // score <= now
+    assert.equal(s.has('https://x/unknown'), false); // never suppressed
+  });
+
+  it('suppressRefeed overwrites with a later (failure) window', async function () {
+    const now = 2_000_000;
+    await redisCache.suppressRefeed('https://x/u', now + 1000); // in-flight window
+    await redisCache.suppressRefeed('https://x/u', now + 600000); // failure extends it
+    const stillAt = await redisCache.suppressedSet(['https://x/u'], now + 300000);
+    assert.equal(stillAt.has('https://x/u'), true); // the longer window won
+  });
+
+  it('sweepRefeedSuppress drops only entries that have expired', async function () {
+    const now = 3_000_000;
+    await redisCache.suppressRefeed('https://x/keep', now + 5000);
+    await redisCache.suppressRefeed('https://x/drop', now - 5000);
+    await redisCache.sweepRefeedSuppress(now);
+    assert.equal(client._z.has('https://x/keep'), true);
+    assert.equal(client._z.has('https://x/drop'), false);
+  });
+
+  it('producer lock is single-holder: second acquire fails until released', async function () {
+    const got1 = await redisCache.acquireProducerLock('boxA', 30000);
+    const got2 = await redisCache.acquireProducerLock('boxB', 30000);
+    assert.equal(got1, true);
+    assert.equal(got2, false); // already held -> only one producer per pass
+    await redisCache.releaseProducerLock('boxB'); // not the owner -> no-op
+    assert.equal(await redisCache.acquireProducerLock('boxB', 30000), false);
+    await redisCache.releaseProducerLock('boxA'); // owner releases
+    assert.equal(await redisCache.acquireProducerLock('boxB', 30000), true);
+  });
+
+  it('queue distributes atomically: enqueue then two consumers split with no double-pop', async function () {
+    await redisCache.enqueue(['u1', 'u2', 'u3', 'u4'], 2);
+    const boxA = [];
+    const boxB = [];
+    for (let i = 0; i < 4; i += 1) {
+      const got = await redisCache.dequeue(1);
+      (i % 2 ? boxB : boxA).push(...got);
+    }
+    assert.deepEqual([...boxA, ...boxB].sort(), ['u1', 'u2', 'u3', 'u4']); // each once
+    assert.equal(boxA.length, 2); // even split
+    assert.equal(boxB.length, 2);
+    assert.equal(await redisCache.queueDepth(), 0); // fully drained
   });
 
   it('previewPattern returns total/matched/sample and rejects a bad regex', async function () {

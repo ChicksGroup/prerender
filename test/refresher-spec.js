@@ -607,3 +607,205 @@ describe('refresher adaptive concurrency', function () {
     assert.ok(refresher._getLimit() < before); // backed off despite the 200
   });
 });
+
+describe('refresher single-producer queue feed', function () {
+  const flush = () => new Promise((r) => setImmediate(r));
+  afterEach(function () {
+    refresher.stop();
+    delete process.env.REFRESHER_CONCURRENCY;
+    delete process.env.REFRESHER_QUEUE_TARGET;
+    delete process.env.REFRESHER_PRODUCE;
+    delete process.env.REFRESHER_PRODUCE_INTERVAL_MS;
+    delete process.env.REFRESHER_FAIL_COOLDOWN_MS;
+  });
+
+  // Start with the producer deps stubbed; each test overrides what it exercises.
+  function startProducer(over) {
+    refresher.start(
+      makeServer(0),
+      3000,
+      Object.assign(
+        {
+          manual: true,
+          render: pendingRender,
+          dueForRefresh: () =>
+            Promise.resolve({ p2xx: [], plow: [], scanned: 0, evicted: 0 }),
+          queueDepth: () => Promise.resolve(0),
+          acquireProducerLock: () => Promise.resolve(true),
+          releaseProducerLock: () => Promise.resolve(),
+          suppressedSet: () => Promise.resolve(new Set()),
+          sweepRefeedSuppress: () => Promise.resolve(),
+          enqueue: () => Promise.resolve(0),
+        },
+        over || {},
+      ),
+    );
+  }
+
+  it('fills the queue with due 2xx before 3xx (priority tiers)', async function () {
+    const enq = [];
+    startProducer({
+      dueForRefresh: ({ classified }) =>
+        Promise.resolve(
+          classified
+            ? { p2xx: ['a', 'b'], plow: ['r1'], scanned: 3, evicted: 0 }
+            : [],
+        ),
+      enqueue: (urls, p) => {
+        enq.push({ urls, p });
+        return Promise.resolve(urls.length);
+      },
+    });
+    await refresher._produceTick();
+    assert.deepEqual(enq.find((e) => e.p === 2).urls, ['a', 'b']); // 2xx tier
+    assert.deepEqual(enq.find((e) => e.p === 3).urls, ['r1']); // 3xx behind them
+  });
+
+  it('tops the queue up only to REFRESHER_QUEUE_TARGET', async function () {
+    process.env.REFRESHER_QUEUE_TARGET = '5';
+    let askedLimit = null;
+    startProducer({
+      queueDepth: () => Promise.resolve(3), // 5 - 3 = 2 free slots
+      dueForRefresh: ({ limit }) => {
+        askedLimit = limit;
+        return Promise.resolve({ p2xx: [], plow: [], scanned: 0, evicted: 0 });
+      },
+    });
+    await refresher._produceTick();
+    assert.equal(askedLimit, 2);
+  });
+
+  it('does not scan or enqueue when the queue is already at target, but still sweeps', async function () {
+    process.env.REFRESHER_QUEUE_TARGET = '5';
+    let scanned = false;
+    const enqueue = sinon.spy();
+    const sweep = sinon.spy();
+    startProducer({
+      queueDepth: () => Promise.resolve(5), // need <= 0
+      dueForRefresh: () => {
+        scanned = true;
+        return Promise.resolve({ p2xx: [], plow: [], scanned: 0, evicted: 0 });
+      },
+      enqueue,
+      sweepRefeedSuppress: sweep,
+    });
+    await refresher._produceTick();
+    assert.equal(scanned, false);
+    assert(enqueue.notCalled);
+    // The suppression ZSET must be swept every pass even with a full queue, else it
+    // grows unbounded (every render on every box appends to it).
+    assert(sweep.calledOnce);
+  });
+
+  it('skips URLs that are in flight / cooling down (suppressed)', async function () {
+    const enq = [];
+    startProducer({
+      dueForRefresh: ({ classified }) =>
+        Promise.resolve(
+          classified ? { p2xx: ['a', 'b'], plow: [], scanned: 2, evicted: 0 } : [],
+        ),
+      suppressedSet: () => Promise.resolve(new Set(['b'])),
+      enqueue: (urls, p) => {
+        enq.push({ urls, p });
+        return Promise.resolve(urls.length);
+      },
+    });
+    await refresher._produceTick();
+    assert.deepEqual(enq.find((e) => e.p === 2).urls, ['a']); // 'b' suppressed out
+  });
+
+  it('produces on only one box: no scan/enqueue without the cluster lock', async function () {
+    let scanned = false;
+    const enqueue = sinon.spy();
+    const release = sinon.spy();
+    startProducer({
+      acquireProducerLock: () => Promise.resolve(false), // another box leads
+      releaseProducerLock: release,
+      dueForRefresh: () => {
+        scanned = true;
+        return Promise.resolve({ p2xx: [], plow: [], scanned: 0, evicted: 0 });
+      },
+      enqueue,
+    });
+    await refresher._produceTick();
+    assert.equal(scanned, false);
+    assert(enqueue.notCalled);
+    assert(release.notCalled); // never acquired -> nothing to release
+  });
+
+  it('marks a launched URL in flight so the producer will not re-feed it', async function () {
+    const suppress = sinon.spy();
+    refresher.start(makeServer(0), 3000, {
+      manual: true,
+      render: pendingRender,
+      dequeue: (n) => Promise.resolve(['q1'].slice(0, n)),
+      dueForRefresh: () => Promise.resolve([]),
+      suppressRefeed: suppress,
+    });
+    await refresher._tickOnce();
+    assert(suppress.calledWith('q1'));
+    assert(suppress.firstCall.args[1] > Date.now()); // a future "until" ms
+  });
+
+  it('claims the reflock for queue items and drops ones it cannot claim', async function () {
+    process.env.REFRESHER_CONCURRENCY = '4';
+    const launched = [];
+    const claimed = [];
+    refresher.start(makeServer(0), 3000, {
+      manual: true,
+      render: (u) => {
+        launched.push(u);
+        return Promise.resolve(200);
+      },
+      dequeue: (n) => Promise.resolve(['q1', 'q2'].slice(0, n)),
+      dueForRefresh: () => Promise.resolve([]),
+      // q2 is held by another box (cooling-down failure) -> claim fails.
+      claim: (u) => {
+        claimed.push(u);
+        return Promise.resolve(u !== 'q2');
+      },
+    });
+    await refresher._tickOnce();
+    await flush();
+    assert.deepEqual(claimed.sort(), ['q1', 'q2']); // both attempted cross-instance
+    assert.deepEqual(launched, ['q1']); // q2 unclaimable -> dropped, not rendered
+  });
+
+  it('disables the producer + suppression writes when the interval is <= 0', async function () {
+    process.env.REFRESHER_PRODUCE_INTERVAL_MS = '0';
+    const suppress = sinon.spy();
+    refresher.start(makeServer(0), 3000, {
+      manual: true,
+      render: () => Promise.resolve(200),
+      dequeue: (n) => Promise.resolve(['q1'].slice(0, n)),
+      dueForRefresh: () => Promise.resolve([]),
+      suppressRefeed: suppress,
+    });
+    await refresher._tickOnce();
+    await flush();
+    // cfg.produce is forced false (no sweeper would run), so launch() must NOT
+    // append to the suppression ZSET — otherwise it would grow unbounded.
+    assert(suppress.notCalled);
+  });
+
+  it('extends suppression by the failure cooldown when a render fails', async function () {
+    process.env.REFRESHER_CONCURRENCY = '1';
+    process.env.REFRESHER_FAIL_COOLDOWN_MS = '600000';
+    const suppress = sinon.spy();
+    refresher.start(makeServer(0), 3000, {
+      manual: true,
+      render: () => Promise.resolve(504),
+      dueForRefresh: ({ limit, exclude }) =>
+        Promise.resolve(['x'].filter((u) => !exclude.has(u)).slice(0, limit)),
+      suppressRefeed: suppress,
+    });
+    await refresher._tickOnce();
+    await flush();
+    const xUntils = suppress
+      .getCalls()
+      .filter((c) => c.args[0] === 'x')
+      .map((c) => c.args[1]);
+    assert(xUntils.length >= 2); // in-flight at launch + cooldown at failure
+    assert(Math.max(...xUntils) > Date.now() + 135000); // failure window is longer
+  });
+});
