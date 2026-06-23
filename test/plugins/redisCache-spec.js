@@ -401,14 +401,21 @@ describe('redisCache introspection & guards', function () {
 
   function makeFakeRedis() {
     const kv = new Map();
-    const z = new Map(); // member -> score
+    const zsets = new Map(); // zkey -> Map(member -> score) — one ZSET per key
     const h = new Map(); // hashKey -> Map(field -> number)
     const l = new Map(); // listKey -> array (index 0 = head, LPUSH prepends)
-    const sortedAsc = () => [...z.entries()].sort((a, b) => a[1] - b[1]);
+    const IDX = 'prerender:v1:index';
+    const zfor = (key) => {
+      if (!zsets.has(key)) zsets.set(key, new Map());
+      return zsets.get(key);
+    };
+    const sortedAsc = (zm) => [...zm.entries()].sort((a, b) => a[1] - b[1]);
     const withScores = (pairs) => pairs.flatMap(([m, s]) => [m, String(s)]);
     return {
       _kv: kv,
-      _z: z,
+      _z: zfor(IDX), // the main index ZSET (back-compat for existing tests)
+      _zfor: zfor, // any ZSET by key (per-class indexes, queue, cooldown, ...)
+      _zsets: zsets,
       _h: h,
       _l: l,
       lpush: (key, val) => {
@@ -449,69 +456,83 @@ describe('redisCache introspection & guards', function () {
       zadd: (key, ...rest) => {
         // Two forms: (key, score, member) and (key, 'NX', score, member). The
         // queue/producer paths use NX (keep an already-present member's score).
+        // Also accepts variadic score/member pairs (the class-index backfill).
         let nx = false;
-        let score;
-        let member;
+        let pairs = rest;
         if (typeof rest[0] === 'string' && /^(NX|XX|GT|LT|CH)$/.test(rest[0])) {
           nx = rest[0] === 'NX';
-          [, score, member] = rest;
-        } else {
-          [score, member] = rest;
+          pairs = rest.slice(1);
         }
-        if (nx && z.has(member)) return Promise.resolve(0);
-        z.set(member, Number(score));
-        return Promise.resolve(1);
+        const zm = zfor(key);
+        let added = 0;
+        for (let i = 0; i + 1 < pairs.length; i += 2) {
+          const score = pairs[i];
+          const member = pairs[i + 1];
+          if (nx && zm.has(member)) continue;
+          if (!zm.has(member)) added += 1;
+          zm.set(member, Number(score));
+        }
+        return Promise.resolve(added);
       },
-      zscore: (key, member) =>
-        Promise.resolve(z.has(member) ? String(z.get(member)) : null),
-      zmscore: (key, ...members) =>
-        Promise.resolve(members.map((m) => (z.has(m) ? String(z.get(m)) : null))),
+      zscore: (key, member) => {
+        const zm = zfor(key);
+        return Promise.resolve(zm.has(member) ? String(zm.get(member)) : null);
+      },
+      zmscore: (key, ...members) => {
+        const zm = zfor(key);
+        return Promise.resolve(members.map((m) => (zm.has(m) ? String(zm.get(m)) : null)));
+      },
       zpopmin: (key, count) => {
+        const zm = zfor(key);
         const n = Math.max(1, count || 1);
         const out = [];
-        for (const [m, s] of sortedAsc().slice(0, n)) {
-          z.delete(m);
+        for (const [m, s] of sortedAsc(zm).slice(0, n)) {
+          zm.delete(m);
           out.push(m, String(s));
         }
         return Promise.resolve(out);
       },
       zremrangebyscore: (key, min, max) => {
+        const zm = zfor(key);
         const minN = min === '-inf' ? -Infinity : Number(min);
         const maxN = max === '+inf' ? Infinity : Number(max);
         let removed = 0;
-        for (const [m, s] of [...z.entries()]) {
+        for (const [m, s] of [...zm.entries()]) {
           if (s >= minN && s <= maxN) {
-            z.delete(m);
+            zm.delete(m);
             removed += 1;
           }
         }
         return Promise.resolve(removed);
       },
-      zcard: () => Promise.resolve(z.size),
+      zcard: (key) => Promise.resolve(zfor(key).size),
       zrange: (key, start, stop, ws) => {
-        const arr = sortedAsc();
+        const arr = sortedAsc(zfor(key));
         const slice = arr.slice(start, stop === -1 ? arr.length : stop + 1);
         return Promise.resolve(ws ? withScores(slice) : slice.map(([m]) => m));
       },
       zrevrange: (key, start, stop, ws) => {
-        const arr = sortedAsc().reverse();
+        const arr = sortedAsc(zfor(key)).reverse();
         const slice = arr.slice(start, stop === -1 ? arr.length : stop + 1);
         return Promise.resolve(ws ? withScores(slice) : slice.map(([m]) => m));
       },
       zrangebyscore: (key, min, max, ws, limitKw, offset, count) => {
         const minN = min === '-inf' ? -Infinity : Number(min);
         const maxN = max === '+inf' ? Infinity : Number(max);
-        let arr = sortedAsc().filter(([, s]) => s >= minN && s <= maxN);
+        let arr = sortedAsc(zfor(key)).filter(([, s]) => s >= minN && s <= maxN);
         if (limitKw === 'LIMIT') arr = arr.slice(offset, offset + count);
         return Promise.resolve(ws ? withScores(arr) : arr.map(([m]) => m));
       },
       get: (k) => Promise.resolve(kv.has(k) ? kv.get(k) : null),
-      del: (k) => {
-        kv.delete(k);
-        return Promise.resolve(1);
+      del: (...keys) => {
+        let n = 0;
+        for (const k of keys) {
+          if (kv.delete(k) || zsets.delete(k) || h.delete(k) || l.delete(k)) n += 1;
+        }
+        return Promise.resolve(n);
       },
       zrem: (key, member) => {
-        z.delete(member);
+        zfor(key).delete(member);
         return Promise.resolve(1);
       },
       hset: (key, field, val) => {
@@ -739,18 +760,22 @@ describe('redisCache introspection & guards', function () {
       client._z.set(u, now - (200 + i) * 86400e3);
       await client.hset('prerender:v1:status', u, 404);
     }
-    // Track concurrent evict()s by instrumenting zrem (exactly one per evict),
+    // Track concurrent evict()s by instrumenting the MAIN-index zrem (exactly one
+    // per evict; evict() also zrem's the per-class indexes, which we ignore here),
     // resolving on a later microtask so a whole batch is in-flight at once.
     let inFlight = 0;
     let peak = 0;
     const realZrem = client.zrem.bind(client);
     client.zrem = (key, member) => {
-      inFlight += 1;
-      peak = Math.max(peak, inFlight);
+      const isIndex = key === 'prerender:v1:index';
+      if (isIndex) {
+        inFlight += 1;
+        peak = Math.max(peak, inFlight);
+      }
       return Promise.resolve()
         .then(() => realZrem(key, member))
         .then((r) => {
-          inFlight -= 1;
+          if (isIndex) inFlight -= 1;
           return r;
         });
     };
@@ -1503,6 +1528,145 @@ describe('redisCache introspection & guards', function () {
     assert.equal(sel.evicted, 0);
   });
 
+  it('class index reaches a due 2xx buried behind a wall of not-due 3xx', async function () {
+    const now = Date.now();
+    const day = 86400e3;
+    // 60 not-due 3xx (~3 days old, under a 7d redirect TTL) that rank OLDER than the
+    // due 2xx (2 days old, 1d TTL) — so in the main index they sit AHEAD of it.
+    for (let i = 0; i < 60; i += 1) {
+      const u = 'https://x/redir/' + i;
+      client._z.set(u, now - 3 * day - i);
+      await client.hset('prerender:v1:status', u, 301);
+    }
+    client._z.set('https://x/page', now - 2 * day);
+    await client.hset('prerender:v1:status', 'https://x/page', 200);
+    // maxScan=10 is SMALLER than the 60-wide 3xx wall: the legacy oldest-first scan
+    // would exhaust its budget on the wall and never reach the 2xx. The per-class
+    // index seeks straight to the due 2xx regardless.
+    const sel = await redisCache.dueForRefresh({
+      classified: true,
+      limit: 5,
+      maxScan: 10,
+      refreshTtlMs: day,
+      redirectTtlMs: 7 * day,
+      now,
+    });
+    assert.deepEqual(sel.p2xx, ['https://x/page']);
+    assert.deepEqual(sel.plow, []); // the 3xx are not yet due
+  });
+
+  it('backfillClassIndex populates the class indexes from the main index, marks ready', async function () {
+    const now = Date.now();
+    for (const [u, code] of [
+      ['https://x/p', 200],
+      ['https://x/r', 301],
+      ['https://x/e', 404],
+    ]) {
+      client._z.set(u, now);
+      await client.hset('prerender:v1:status', u, code);
+    }
+    const r = await redisCache.backfillClassIndex({});
+    assert.equal(r.added2xx, 1);
+    assert.equal(r.added3xx, 1);
+    assert(client._zfor('prerender:v1:index:2xx').has('https://x/p'));
+    assert(client._zfor('prerender:v1:index:3xx').has('https://x/r'));
+    assert(!client._zfor('prerender:v1:index:2xx').has('https://x/e')); // 4xx isn't refreshed
+    assert.equal(client._kv.get('prerender:v1:index:classready'), '1');
+    // Idempotent: a second pass short-circuits on the marker.
+    const r2 = await redisCache.backfillClassIndex({});
+    assert.equal(r2.skipped, 'ready');
+  });
+
+  it('remove() drops the URL from the per-class index too', async function () {
+    client._z.set('https://x/p', Date.now());
+    await client.hset('prerender:v1:status', 'https://x/p', 200);
+    await redisCache.backfillClassIndex({});
+    assert(client._zfor('prerender:v1:index:2xx').has('https://x/p'));
+    await redisCache.remove(['https://x/p']);
+    assert(!client._zfor('prerender:v1:index:2xx').has('https://x/p'));
+    assert(!client._z.has('https://x/p')); // and the main index
+  });
+
+  it('class-indexed selection skips excluded URLs and reaps a no-render ghost', async function () {
+    const now = Date.now();
+    const day = 86400e3;
+    for (const u of ['https://x/keep', 'https://x/busy', 'https://x/blocked']) {
+      client._z.set(u, now - 2 * day);
+      await client.hset('prerender:v1:status', u, 200);
+    }
+    await redisCache.backfillClassIndex({});
+    // A no-render rule added AFTER caching: the entry is a ghost to be reaped.
+    redisCache._setNoRenderRulesForTests([{ pattern: '/blocked', statusCode: 410 }]);
+    const sel = await redisCache.dueForRefresh({
+      classified: true,
+      limit: 10,
+      exclude: new Set(['https://x/busy']),
+      refreshTtlMs: day,
+      now,
+    });
+    assert.deepEqual(sel.p2xx, ['https://x/keep']); // busy excluded, blocked evicted
+    assert(!client._zfor('prerender:v1:index:2xx').has('https://x/blocked'));
+    assert(!client._z.has('https://x/blocked')); // reaped from the main index as well
+  });
+
+  it('store moves an entry between class indexes when its status class changes', async function () {
+    const url = 'https://x/flip';
+    const big = '<html><body>' + 'y'.repeat(600) + '</body></html>';
+    const sink = { send() {}, setHeader() {} };
+    // Cached as 200 -> lands in index:2xx only.
+    await redisCache.beforeSend(
+      makeReq({ prerender: { url, statusCode: 200, content: big, headers: {}, _cacheLockOwner: true } }),
+      sink,
+      () => {},
+    );
+    assert(client._zfor('prerender:v1:index:2xx').has(url));
+    assert(!client._zfor('prerender:v1:index:3xx').has(url));
+    // Re-rendered as a 301 -> moves to index:3xx, leaves index:2xx.
+    await redisCache.beforeSend(
+      makeReq({
+        prerender: {
+          url,
+          statusCode: 301,
+          content: big,
+          headers: { location: 'https://x/dest' },
+          _cacheLockOwner: true,
+        },
+      }),
+      sink,
+      () => {},
+    );
+    assert(!client._zfor('prerender:v1:index:2xx').has(url));
+    assert(client._zfor('prerender:v1:index:3xx').has(url));
+  });
+
+  it('rebuilds the class index after the ready marker is cleared (no stale in-process trust)', async function () {
+    const now = Date.now();
+    const day = 86400e3;
+    client._z.set('https://x/p', now - 2 * day);
+    await client.hset('prerender:v1:status', 'https://x/p', 200);
+    // First pass builds the class index and finds the due 2xx.
+    let sel = await redisCache.dueForRefresh({ classified: true, limit: 5, refreshTtlMs: day, now });
+    assert.deepEqual(sel.p2xx, ['https://x/p']);
+    // Simulate a /cache/flush on ANOTHER box: the cluster-wide marker + class index
+    // are gone. A stale in-process "ready" flag would make us trust an empty index
+    // forever; instead the marker is re-read every pass, so we rebuild.
+    client._kv.delete('prerender:v1:index:classready');
+    client._zfor('prerender:v1:index:2xx').clear();
+    sel = await redisCache.dueForRefresh({ classified: true, limit: 5, refreshTtlMs: day, now });
+    assert.deepEqual(sel.p2xx, ['https://x/p']); // rebuilt + found again
+  });
+
+  it('backfill does not mark an empty result ready while the main index is populated', async function () {
+    client._z.set('https://x/p', Date.now());
+    await client.hset('prerender:v1:status', 'https://x/p', 200);
+    const realZrange = client.zrange.bind(client);
+    client.zrange = () => Promise.resolve([]); // simulate a transient empty/error page
+    const r = await redisCache.backfillClassIndex({});
+    client.zrange = realZrange;
+    assert.equal(r.skipped, 'retry');
+    assert.equal(client._kv.has('prerender:v1:index:classready'), false); // NOT marked ready
+  });
+
   it('suppressRefeed + suppressedSet: only members with score > now are suppressed', async function () {
     const now = 1_000_000;
     await redisCache.suppressRefeed('https://x/inflight', now + 5000);
@@ -1529,8 +1693,9 @@ describe('redisCache introspection & guards', function () {
     await redisCache.suppressRefeed('https://x/keep', now + 5000);
     await redisCache.suppressRefeed('https://x/drop', now - 5000);
     await redisCache.sweepRefeedSuppress(now);
-    assert.equal(client._z.has('https://x/keep'), true);
-    assert.equal(client._z.has('https://x/drop'), false);
+    const cd = client._zfor('prerender:v1:queue:cooldown');
+    assert.equal(cd.has('https://x/keep'), true);
+    assert.equal(cd.has('https://x/drop'), false);
   });
 
   it('producer lock is single-holder: second acquire fails until released', async function () {
@@ -2314,7 +2479,8 @@ describe('redisCache spaces store (CACHE_STORE=spaces)', function () {
     await redisCache.beforeSend(req, res, next);
     assert.equal(store._m.size, 1); // body in Spaces
     assert(client.set.notCalled); // body NOT written to Redis
-    assert(client.zadd.calledOnce); // indexed for refresh
+    assert(client.zadd.calledWith('prerender:v1:index')); // indexed for refresh
+    assert(client.zadd.calledWith('prerender:v1:index:2xx')); // + per-class index
     assert(next.calledOnce);
   });
 
@@ -2546,8 +2712,9 @@ describe('redisCache flush (admin reset)', function () {
     assert.equal(r.store, 'spaces');
     assert.equal(r.bodies, 42); // from objectStore.deleteAllUnderPrefix
     assert(store.deleteAllUnderPrefix.calledWith('v1/html/')); // prefix '' + v1/html/
-    // 4 structural DELs (index/status/queue/attempts) + 1 scanned lock key
-    assert.equal(r.structuralKeys, 5);
+    // 7 structural DELs (index/status/queue/attempts + index:2xx/index:3xx +
+    // the class-index ready marker) + 1 scanned lock key
+    assert.equal(r.structuralKeys, 8);
     assert.equal(r.metricsLabels, 0); // metrics untouched
   });
 
@@ -2559,7 +2726,7 @@ describe('redisCache flush (admin reset)', function () {
     const r = await redisCache.flush({ cache: true });
     assert.equal(r.store, 'redis');
     assert.equal(r.bodies, 3); // 3 html keys from SCAN
-    assert.equal(r.structuralKeys, 5);
+    assert.equal(r.structuralKeys, 8); // 7 structural keys + 1 scanned lock key
   });
 
   it('metrics scope clears every per-label metrics HASH only', async function () {
