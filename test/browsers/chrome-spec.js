@@ -105,6 +105,29 @@ describe('chrome', function () {
     });
   });
 
+  describe('_isBrowserLocalRequest (in-flight tracking exclusion)', function () {
+    it('excludes blob: and data: pseudo-requests', function () {
+      assert.strictEqual(
+        chrome._isBrowserLocalRequest(
+          'blob:https://chicksgold.com/936631d2-74b4-4868-84cf-b955e9ae9489',
+        ),
+        true,
+      );
+      assert.strictEqual(
+        chrome._isBrowserLocalRequest('data:image/png;base64,iVBORw0KGgo='),
+        true,
+      );
+    });
+
+    it('tracks real network fetches', function () {
+      assert.strictEqual(
+        chrome._isBrowserLocalRequest('https://chicksgold.com/api/items'),
+        false,
+      );
+      assert.strictEqual(chrome._isBrowserLocalRequest(''), false);
+    });
+  });
+
   describe('loadUrlThenWaitForPageLoadEvent', function () {
     let tab;
     let sandbox;

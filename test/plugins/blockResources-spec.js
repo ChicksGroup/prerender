@@ -64,6 +64,32 @@ describe('blockResources plugin', function () {
       );
     });
 
+    it('blocks Stripe helper iframes but NOT the main Stripe.js script', function () {
+      assert.strictEqual(
+        shouldBlockRequest(
+          'Document',
+          'https://js.stripe.com/v3/controller-with-preconnect-63c674388cc83114f8b13894ef9b8a34.html',
+        ),
+        true,
+      );
+      assert.strictEqual(
+        shouldBlockRequest(
+          'Document',
+          'https://js.stripe.com/v3/m-outer-3437aaddcdf6922d623e172c2d6f9278.html',
+        ),
+        true,
+      );
+      assert.strictEqual(
+        shouldBlockRequest('Document', 'https://m.stripe.network/inner.html'),
+        true,
+      );
+      // The SPA may await window.Stripe at boot — the loader stays allowed.
+      assert.strictEqual(
+        shouldBlockRequest('Script', 'https://js.stripe.com/v3/'),
+        false,
+      );
+    });
+
     it('blocks IP-echo APIs (ipify) regardless of resourceType', function () {
       assert.strictEqual(
         shouldBlockRequest('Fetch', 'https://api.ipify.org/'),
