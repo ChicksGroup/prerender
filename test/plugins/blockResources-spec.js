@@ -64,6 +64,51 @@ describe('blockResources plugin', function () {
       );
     });
 
+    it('blocks IP-echo APIs (ipify) regardless of resourceType', function () {
+      assert.strictEqual(
+        shouldBlockRequest('Fetch', 'https://api.ipify.org/'),
+        true,
+      );
+      assert.strictEqual(
+        shouldBlockRequest('XHR', 'https://api64.ipify.org/?format=json'),
+        true,
+      );
+    });
+
+    describe('BLOCKED_URL_SUBSTRINGS env extension', function () {
+      const ORIGINAL = process.env.BLOCKED_URL_SUBSTRINGS;
+
+      afterEach(function () {
+        if (ORIGINAL === undefined) delete process.env.BLOCKED_URL_SUBSTRINGS;
+        else process.env.BLOCKED_URL_SUBSTRINGS = ORIGINAL;
+        blockResources.init();
+      });
+
+      it('blocks an operator-listed substring after init()', function () {
+        process.env.BLOCKED_URL_SUBSTRINGS = ' broken.example.com , other.cdn ';
+        blockResources.init();
+        assert.strictEqual(
+          shouldBlockRequest('Fetch', 'https://broken.example.com/api'),
+          true,
+        );
+        assert.strictEqual(
+          shouldBlockRequest('Script', 'https://other.cdn/lib.js'),
+          true,
+        );
+      });
+
+      it('stops blocking once the env entry is removed and init() re-runs', function () {
+        process.env.BLOCKED_URL_SUBSTRINGS = 'broken.example.com';
+        blockResources.init();
+        delete process.env.BLOCKED_URL_SUBSTRINGS;
+        blockResources.init();
+        assert.strictEqual(
+          shouldBlockRequest('Fetch', 'https://broken.example.com/api'),
+          false,
+        );
+      });
+    });
+
     it('blocks analytics/ads/widget hosts regardless of resourceType', function () {
       assert.strictEqual(
         shouldBlockRequest(
