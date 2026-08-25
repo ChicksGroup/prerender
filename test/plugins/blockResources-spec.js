@@ -90,6 +90,31 @@ describe('blockResources plugin', function () {
       );
     });
 
+    it('blocks the SignalR live-update hub but NOT the content API', function () {
+      assert.strictEqual(
+        shouldBlockRequest(
+          'XHR',
+          'https://polling.chicksgroup.com/signalRHub?id=AsqkZ1hrN1rqmMfXkpngeg',
+        ),
+        true,
+      );
+      assert.strictEqual(
+        shouldBlockRequest(
+          'XHR',
+          'https://polling.chicksgroup.com/signalRHub/negotiate',
+        ),
+        true,
+      );
+      // The content API the DOM is built from must stay allowed.
+      assert.strictEqual(
+        shouldBlockRequest(
+          'Fetch',
+          'https://api.chicksgroup.com/LanguageWebsite/ByWebsite?websiteShortCode=CX',
+        ),
+        false,
+      );
+    });
+
     it('blocks IP-echo APIs (ipify) regardless of resourceType', function () {
       assert.strictEqual(
         shouldBlockRequest('Fetch', 'https://api.ipify.org/'),
@@ -181,7 +206,10 @@ describe('blockResources plugin', function () {
         'https://chicksgold.com/chicksgroup~9f5ed9db.abc.bundle.js', // JS bundle
         'https://chicksgold.com/app~378b5940.def.bundle.css', // CSS bundle
         'https://api.chicksgroup.com/Product/foo?', // content API
-        'https://signalr.chicksgroup.com/signalRHub?', // realtime
+        // NB: the signalR hub used to be on this allowed list ("realtime") —
+        // until 2026-08-25 showed its long-poll parks 1-2 requests in flight
+        // for the whole render, so pages that open it never reach network-idle.
+        // It is now deliberately blocked (see the SignalR test above).
         'https://chicksgold.com/cdn-cgi/challenge-platform/scripts/jsd/main.js', // CF challenge — must NOT be blocked
       ];
       allowed.forEach((u) =>
