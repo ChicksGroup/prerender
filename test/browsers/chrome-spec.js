@@ -82,6 +82,14 @@ describe('chrome', function () {
       );
     });
 
+    it('EXTRA_DOMAINS alone (no ALLOWED_DOMAINS) does NOT disable the legacy behavior', function () {
+      process.env.DIRTY_RENDER_EXTRA_DOMAINS = 'stripe.com';
+      assert.strictEqual(
+        chrome._isCriticalSubresource('https://api.ipify.org/', PAGE),
+        true,
+      );
+    });
+
     it('DIRTY_RENDER_ALL_HOSTS=true forces legacy behavior', function () {
       process.env.ALLOWED_DOMAINS = 'chicksgold.com';
       process.env.DIRTY_RENDER_ALL_HOSTS = 'true';
